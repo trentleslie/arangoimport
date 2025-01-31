@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = [
     { name = "Trent Leslie", email = "trent.leslie@phenomehealth.com" },
 ]
-description = "A tool for importing data into ArangoDB"
+description = "A high-performance tool for importing Neo4j JSONL graph data exports into ArangoDB"
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
