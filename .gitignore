@@ -169,3 +169,25 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Ruff
+.ruff_cache/
+
+# ArangoDB
+arangodb_apps/
+arangodb_data/
+
+# Logs
+logs/
+*.log.*
+
+# VS Code
+.vscode/
+
+# Local development
+.env.local
+.env.*.local
+
+# System files
+.DS_Store
+Thumbs.db
