@@ -113,15 +113,18 @@ class ArangoConnection:
     def create_database(self, db_name: str) -> None:
         """Create a database if it does not exist.
 
-        This method connects to the _system database to create a new database if needed.
-        Handles connection, client, and network-related errors during the process.
+        This method connects to the _system database to create a new database if
+        needed. Handles connection, client, and network-related errors during the
+        process. In parallel processing scenarios, multiple processes may attempt
+        to create the database at once. If the database exists when we try to
+        create it, we'll log this at debug level and continue.
 
         Args:
             db_name: Database name to create
 
         Raises:
-            ArangoError: If database creation fails due to connection, authentication,
-                or other client errors
+            ArangoError: If database creation fails due to connection,
+                authentication, or other client errors
         """
         try:
             sys_db = self.client.db(
@@ -135,9 +138,18 @@ class ArangoConnection:
 
             # Check if database exists
             if isinstance(databases, list) and db_name not in databases:
-                sys_db.create_database(db_name)
-                logger.info(f"Created database: {db_name}")
-        except (ArangoClientError, OSError, ConnectionAbortedError) as e:
+                try:
+                    sys_db.create_database(db_name)
+                    logger.info(f"Created database: {db_name}")
+                except ArangoClientError as e:
+                    # If error is duplicate database, another process created it first
+                    if "duplicate" in str(e).lower():
+                        logger.debug(
+                            f"Database {db_name} was already created by another process"
+                        )
+                    else:
+                        raise
+        except (OSError, ConnectionAbortedError) as e:
             # Let the original error propagate through
             logger.error(f"Error creating database {db_name}: {e}")
             raise ArangoError(str(e)) from e
