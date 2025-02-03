@@ -249,10 +249,10 @@ def ensure_collections(db: ArangoDatabase) -> None:
     else:
         collection_names = []
 
-    if "nodes" not in collection_names:
-        db.create_collection("nodes")
-    if "edges" not in collection_names:
-        db.create_collection("edges", edge=True)
+    if "Nodes" not in collection_names:
+        db.create_collection("Nodes")
+    if "Edges" not in collection_names:
+        db.create_collection("Edges", edge=True)
 
 
 def process_chunk_data(
@@ -271,8 +271,8 @@ def process_chunk_data(
     nodes_added = 0
     edges_added = 0
 
-    nodes_col = db["nodes"]
-    edges_col = db["edges"]
+    nodes_col = db["Nodes"]
+    edges_col = db["Edges"]
 
     # Process nodes in batches
     nodes = chunk_data.get("nodes", [])
@@ -301,6 +301,54 @@ def process_chunk_data(
                 f"Edges {i + 1}-{min(i + batch_size, len(edges))}: "
                 f"Added {added} of {len(edges)}"
             )
+
+    return nodes_added, edges_added
+
+
+def process_document(
+    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+) -> tuple[int, int]:
+    """Process a single document and save to database.
+
+    Args:
+        doc: Document to process
+        db: ArangoDB database connection
+        progress_queue: Queue to report progress
+
+    Returns:
+        Tuple[int, int]: Number of nodes and edges added
+    """
+    nodes_added = 0
+    edges_added = 0
+
+    if doc.get("type") == "node":
+        nodes_added += batch_save_documents(db["Nodes"], [doc], 1)
+        if progress_queue is not None:
+            progress_queue.put(("node", 1))
+    elif doc.get("type") in ["edge", "relationship"]:
+        # Transform relationship/edge document
+        edge_doc = {}
+        if doc.get("type") == "relationship":
+            # Extract start and end nodes for the edge
+            start_node = doc.get("start", {})
+            end_node = doc.get("end", {})
+            edge_doc = {
+                "_from": f"Nodes/{start_node.get('id', '')}",
+                "_to": f"Nodes/{end_node.get('id', '')}",
+                "type": doc.get("label", ""),
+                "properties": doc.get("properties", {}),
+            }
+        else:  # type == "edge"
+            # Ensure _from and _to have correct collection prefix
+            edge_doc = doc.copy()
+            if "_from" in doc and not doc["_from"].startswith("Nodes/"):
+                edge_doc["_from"] = f"Nodes/{doc['_from']}"
+            if "_to" in doc and not doc["_to"].startswith("Nodes/"):
+                edge_doc["_to"] = f"Nodes/{doc['_to']}"
+
+        edges_added += batch_save_documents(db["Edges"], [edge_doc], 1)
+        if progress_queue is not None:
+            progress_queue.put(("edge", 1))
 
     return nodes_added, edges_added
 
@@ -352,14 +400,9 @@ def process_chunk(
 
                     try:
                         doc = json.loads(line)
-                        if doc.get("type") == "node":
-                            nodes_added += batch_save_documents(db["nodes"], [doc], 1)
-                            if progress_queue is not None:
-                                progress_queue.put(("node", 1))
-                        elif doc.get("type") in ["edge", "relationship"]:
-                            edges_added += batch_save_documents(db["edges"], [doc], 1)
-                            if progress_queue is not None:
-                                progress_queue.put(("edge", 1))
+                        n_added, e_added = process_document(doc, db, progress_queue)
+                        nodes_added += n_added
+                        edges_added += e_added
                     except json.JSONDecodeError:
                         logger.warning(f"Invalid JSON in line: {line[:100]}...")
                         continue
