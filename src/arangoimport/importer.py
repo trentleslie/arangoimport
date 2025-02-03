@@ -206,8 +206,8 @@ def split_json_file(
 
                             # Create edge document with required _from and _to fields
                             edge_doc = {
-                                "_from": f"nodes/{start_node.get('id', '')}",
-                                "_to": f"nodes/{end_node.get('id', '')}",
+                                "_from": f"Nodes/{start_node.get('id', '')}",
+                                "_to": f"Nodes/{end_node.get('id', '')}",
                                 "type": item.get(
                                     "label", ""
                                 ),  # Use relationship label as edge type
