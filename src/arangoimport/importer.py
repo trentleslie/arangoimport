@@ -197,10 +197,26 @@ def split_json_file(
                     item_type = item.get("type", "").lower()
                     if item_type == "node":
                         current_chunk["nodes"].append(item)
-                        current_size += len(line)
-                    elif item_type == "edge":
-                        current_chunk["edges"].append(item)
-                        current_size += len(line)
+                    elif item_type in ["edge", "relationship"]:
+                        # Convert Neo4j relationship format to ArangoDB edge format
+                        if item_type == "relationship":
+                            # Extract start and end nodes for the edge
+                            start_node = item.get("start", {})
+                            end_node = item.get("end", {})
+
+                            # Create edge document with required _from and _to fields
+                            edge_doc = {
+                                "_from": f"nodes/{start_node.get('id', '')}",
+                                "_to": f"nodes/{end_node.get('id', '')}",
+                                "type": item.get(
+                                    "label", ""
+                                ),  # Use relationship label as edge type
+                                "properties": item.get("properties", {}),
+                            }
+                            current_chunk["edges"].append(edge_doc)
+                        else:
+                            current_chunk["edges"].append(item)
+                    current_size += len(line)
 
                     if current_size >= chunk_size:
                         yield write_chunk()
@@ -340,7 +356,7 @@ def process_chunk(
                             nodes_added += batch_save_documents(db["nodes"], [doc], 1)
                             if progress_queue is not None:
                                 progress_queue.put(("node", 1))
-                        elif doc.get("type") == "edge":
+                        elif doc.get("type") in ["edge", "relationship"]:
                             edges_added += batch_save_documents(db["edges"], [doc], 1)
                             if progress_queue is not None:
                                 progress_queue.put(("edge", 1))
