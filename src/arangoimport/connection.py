@@ -1,6 +1,8 @@
 """ArangoDB connection management."""
 
+import fcntl
 import threading
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from queue import Empty, Queue
@@ -126,33 +128,44 @@ class ArangoConnection:
             ArangoError: If database creation fails due to connection,
                 authentication, or other client errors
         """
-        try:
-            sys_db = self.client.db(
-                "_system", username=self.username, password=self.password
-            )
-            databases = sys_db.databases()
+        # Use file lock to synchronize database creation across processes
+        lock_file = f"/tmp/arango_db_{db_name}.lock"
+        with open(lock_file, "w") as f:
+            try:
+                # Get exclusive lock
+                fcntl.flock(f, fcntl.LOCK_EX)
 
-            # Handle async/batch jobs
-            if isinstance(databases, AsyncJob | BatchJob):
-                databases = databases.result()
+                sys_db = self.client.db(
+                    "_system", username=self.username, password=self.password
+                )
+                databases = sys_db.databases()
 
-            # Check if database exists
-            if isinstance(databases, list) and db_name not in databases:
-                try:
-                    sys_db.create_database(db_name)
-                    logger.info(f"Created database: {db_name}")
-                except ArangoClientError as e:
-                    # If error is duplicate database, another process created it first
-                    if "duplicate" in str(e).lower():
-                        logger.debug(
-                            f"Database {db_name} was already created by another process"
-                        )
-                    else:
-                        raise
-        except (OSError, ConnectionAbortedError) as e:
-            # Let the original error propagate through
-            logger.error(f"Error creating database {db_name}: {e}")
-            raise ArangoError(str(e)) from e
+                # Handle async/batch jobs
+                if isinstance(databases, AsyncJob | BatchJob):
+                    databases = databases.result()
+
+                # Check if database exists
+                if isinstance(databases, list) and db_name not in databases:
+                    try:
+                        sys_db.create_database(db_name)
+                        logger.info(f"Created database: {db_name}")
+                        # Sleep briefly to allow database creation to complete
+                        time.sleep(0.5)
+                    except ArangoClientError as e:
+                        # If error is duplicate database,
+                        # another process created it first
+                        if "duplicate" in str(e).lower():
+                            msg = "Database {} was already created by another process"
+                            logger.debug(msg.format(db_name))
+                        else:
+                            raise
+            except (OSError, ConnectionAbortedError) as e:
+                # Let the original error propagate through
+                logger.error(f"Error creating database {db_name}: {e}")
+                raise ArangoError(str(e)) from e
+            finally:
+                # Release lock
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def _init_pool(self) -> None:
         """Initialize connection pool."""
@@ -439,19 +452,37 @@ class ArangoConnection:
         Args:
             db: Database object
         """
-        try:
-            # Create Nodes collection if it doesn't exist
-            if not db.has_collection("Nodes"):
-                db.create_collection("Nodes")
-                logger.info("Created Nodes collection")
+        # Use file lock to synchronize collection creation across processes
+        lock_file = f"/tmp/arango_collections_{self.db_name}.lock"
+        with open(lock_file, "w") as f:
+            try:
+                # Get exclusive lock
+                fcntl.flock(f, fcntl.LOCK_EX)
 
-            # Create Edges collection if it doesn't exist
-            if not db.has_collection("Edges"):
-                db.create_collection("Edges", edge=(EDGE_COLLECTION_TYPE == "edge"))
-                logger.info("Created Edges collection")
-        except CollectionCreateError as e:
-            logger.error(f"Error creating collections: {e}")
-            raise
+                try:
+                    # Create Nodes collection if it doesn't exist
+                    if not db.has_collection("Nodes"):
+                        db.create_collection("Nodes")
+                        logger.info("Created Nodes collection")
+                        # Sleep briefly to allow collection creation to complete
+                        time.sleep(0.5)
+
+                    # Create Edges collection if it doesn't exist
+                    if not db.has_collection("Edges"):
+                        db.create_collection(
+                            "Edges", edge=(EDGE_COLLECTION_TYPE == "edge")
+                        )
+                        logger.info("Created Edges collection")
+                        # Sleep briefly to allow collection creation to complete
+                        time.sleep(0.5)
+                except CollectionCreateError as e:
+                    if "duplicate" not in str(e).lower():
+                        logger.error(f"Error creating collections: {e}")
+                        raise
+                    logger.debug("Collections already exist")
+            finally:
+                # Release lock
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 class ArangoError(Exception):
