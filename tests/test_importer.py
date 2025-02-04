@@ -47,6 +47,7 @@ PROGRESS_TUPLE_SIZE = 2  # Size of progress tuple (nodes_added, edges_added)
 LARGE_TEST_DOCS = 1000  # Number of test documents for large data tests
 MIN_BATCH_CALLS = 40  # Minimum number of batch calls for large data test
 DEFAULT_MAX_CONNECTIONS = 128  # Default maximum connections for ArangoDB
+MAX_TEST_DOCS = 100  # Maximum number of test documents for memory optimization
 
 
 @pytest.fixture
@@ -394,7 +395,8 @@ def test_process_chunk_memory_optimization(temp_json_file: str) -> None:
 
     Tests:
     - Memory handling with large test file
-    - Batching behavior
+    - Batching behavior with both id and _key fields
+    - Document processing with different key formats
     """
     db_config = {
         "db_name": "test_db",
@@ -408,8 +410,14 @@ def test_process_chunk_memory_optimization(temp_json_file: str) -> None:
     large_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
     try:
         # Write multiple documents to test memory handling
-        for i in range(100):  # Write enough documents to test batching
-            large_file.write(f'{{"type":"node","_key":"{i}","data":"test"}}\n')
+        # Mix of documents with id and _key fields
+        for i in range(MAX_TEST_DOCS):
+            if i % 2 == 0:
+                # Use id field for even numbers
+                large_file.write(f'{{"type":"node","id":"{i}","data":"test_id"}}\n')
+            else:
+                # Use _key field for odd numbers
+                large_file.write(f'{{"type":"node","_key":"{i}","data":"test_key"}}\n')
         large_file.close()
 
         with (
@@ -432,13 +440,16 @@ def test_process_chunk_memory_optimization(temp_json_file: str) -> None:
 
             # Verify batching behavior
             assert mock_batch_save.call_count > 0
-            # Check that batch sizes are reasonable
+            # Verify batch sizes are reasonable
             for call in mock_batch_save.call_args_list:
-                _, _, batch_size = call[0]
-                assert batch_size > 0
-                assert batch_size <= MAX_BATCH_SIZE
+                assert len(call[0][1]) <= MAX_TEST_DOCS  # Max batch size
+                # Verify documents have _key field
+                for doc in call[0][1]:
+                    assert "_key" in doc
+                    assert doc["_key"].isdigit()  # Key should be a string number
 
     finally:
+        # Clean up
         os.unlink(large_file.name)
 
 
@@ -575,47 +586,95 @@ def test_process_document_error_handling() -> None:
     Tests:
     - Missing required fields handling
     - Invalid document type handling
-    - Valid document handling
+    - Valid document handling with properties
+    - Unique constraint violation handling
     - Progress reporting
     """
-    db = MagicMock()
-    mock_collection = MagicMock()
-    db.__getitem__.return_value = mock_collection
+    # Mock database and collections
+    mock_db = MagicMock()
+    mock_nodes_col = MagicMock()
+    mock_edges_col = MagicMock()
+    mock_db.__getitem__.side_effect = (
+        lambda x: mock_nodes_col if x == "Nodes" else mock_edges_col
+    )
+
+    # Test progress queue
     progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
 
-    # Mock import_bulk to reject invalid documents
-    def import_bulk_side_effect(docs, **kwargs):
-        if not docs[0].get("_key") or docs[0].get("type") == "invalid":
-            return {"created": 0, "errors": 1}
-        return {"created": 1, "errors": 0}
-
-    mock_collection.import_bulk.side_effect = import_bulk_side_effect
-
-    # Test with missing required fields
-    invalid_doc = {"type": "node"}  # Missing _key
-    nodes_added, edges_added = process_document(invalid_doc, db, progress_queue)
-    assert nodes_added == 0
-    assert edges_added == 0
-
-    # Test with invalid document type
-    invalid_type_doc = {"_key": "1", "type": "invalid"}
-    nodes_added, edges_added = process_document(invalid_type_doc, db, progress_queue)
-    assert nodes_added == 0
-    assert edges_added == 0
-
-    # Test with valid document
-    valid_doc = {"_key": "1", "type": "node"}
-    nodes_added, edges_added = process_document(valid_doc, db, progress_queue)
+    # Test valid node document
+    valid_node = {
+        "type": "node",
+        "id": "123",
+        "label": "TestNode",
+        "properties": {"name": "Test", "value": 42},
+    }
+    mock_nodes_col.import_bulk.return_value = {"created": 1, "errors": 0}
+    nodes_added, edges_added = process_document(valid_node, mock_db, progress_queue)
     assert nodes_added == 1
     assert edges_added == 0
+    progress = progress_queue.get_nowait()
+    assert progress == (1, 0)
 
-    # Test progress reporting
-    assert not progress_queue.empty()
-    progress = progress_queue.get()
-    assert isinstance(progress, tuple)
-    assert len(progress) == PROGRESS_TUPLE_SIZE
-    assert progress[0] >= 0  # nodes_added
-    assert progress[1] >= 0  # edges_added
+    # Test valid relationship document
+    valid_relationship = {
+        "type": "relationship",
+        "id": "456",
+        "label": "CONNECTS",
+        "start": {"id": "123"},
+        "end": {"id": "789"},
+        "properties": {"weight": 0.5},
+    }
+    mock_edges_col.import_bulk.return_value = {"created": 1, "errors": 0}
+    nodes_added, edges_added = process_document(
+        valid_relationship, mock_db, progress_queue
+    )
+    assert nodes_added == 0
+    assert edges_added == 1
+    progress = progress_queue.get_nowait()
+    assert progress == (0, 1)
+
+    # Test unique constraint violation for node
+    mock_nodes_col.import_bulk.side_effect = Exception("unique constraint violated")
+    nodes_added, edges_added = process_document(valid_node, mock_db, progress_queue)
+    assert nodes_added == 0
+    assert edges_added == 0
+
+    # Test unique constraint violation for edge
+    mock_edges_col.import_bulk.side_effect = Exception("unique constraint violated")
+    nodes_added, edges_added = process_document(
+        valid_relationship, mock_db, progress_queue
+    )
+    assert nodes_added == 0
+    assert edges_added == 0
+
+    # Test invalid document type
+    invalid_type = {"type": "invalid", "id": "999"}
+    nodes_added, edges_added = process_document(invalid_type, mock_db, progress_queue)
+    assert nodes_added == 0
+    assert edges_added == 0
+
+    # Test missing required field
+    invalid_node = {
+        "type": "node",
+        # Missing id field
+        "label": "TestNode",
+    }
+    nodes_added, edges_added = process_document(invalid_node, mock_db, progress_queue)
+    assert nodes_added == 0
+    assert edges_added == 0
+
+    # Test missing relationship fields
+    invalid_relationship = {
+        "type": "relationship",
+        "id": "456",
+        # Missing start/end nodes
+        "label": "CONNECTS",
+    }
+    nodes_added, edges_added = process_document(
+        invalid_relationship, mock_db, progress_queue
+    )
+    assert nodes_added == 0
+    assert edges_added == 0
 
 
 def test_get_db_max_connections_error_handling() -> None:
