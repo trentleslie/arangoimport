@@ -32,21 +32,47 @@ def retry_with_backoff(
     max_wait: float = 60.0,
     backoff_factor: float = 2.0,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """Retry a function with exponential backoff."""
+    """Retry a function with exponential backoff.
+
+    This decorator will retry the decorated function on failure with exponential
+    backoff. After max_retries attempts, it will raise the last caught exception.
+
+    Args:
+        max_retries: Maximum number of retries before giving up
+        initial_wait: Initial wait time between retries in seconds
+        max_wait: Maximum wait time between retries in seconds
+        backoff_factor: Factor to multiply wait time by after each failure
+
+    Returns:
+        A decorator function that adds retry behavior to the decorated function.
+        The decorated function will have the same return type as the original
+        function, but may raise exceptions if all retries are exhausted.
+
+    Raises:
+        Exception: The last exception caught from the decorated function after
+        all retries are exhausted.
+    """
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         def wrapper(*args: Any, **kwargs: Any) -> T:
             wait = initial_wait
+            last_error: Exception | None = None
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    logger.warning(f"Attempt {attempt + 1} failed: {e!s}. Retrying...")
-                    time.sleep(min(wait, max_wait))
-                    wait *= backoff_factor
-            raise RuntimeError("Maximum retries exceeded")  # This will never be reached
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Attempt {attempt + 1} failed: {e!s}. Retrying..."
+                        )
+                        time.sleep(min(wait, max_wait))
+                        wait *= backoff_factor
+                    else:
+                        break
+            if last_error is not None:
+                raise last_error
+            raise Exception("max_retries is 0")
 
         return wrapper
 
