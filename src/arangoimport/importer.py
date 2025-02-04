@@ -408,6 +408,75 @@ def process_chunk_data(
     return nodes_added, edges_added
 
 
+def validate_document(doc: dict[str, Any]) -> bool:
+    """Validate document structure.
+
+    Args:
+        doc: Document to validate
+
+    Returns:
+        bool: True if document is valid, False otherwise
+    """
+    try:
+        # Basic validation checks
+        if not all(
+            [
+                isinstance(doc, dict),
+                "type" in doc,
+                doc.get("type", "").lower() in ["node", "relationship"],
+            ]
+        ):
+            logger.warning("Invalid document structure")
+            return False
+
+        doc_type = doc.get("type", "").lower()
+
+        # Node validation
+        if doc_type == "node":
+            is_valid = bool(doc.get("id") or doc.get("_key"))
+            if not is_valid:
+                logger.warning("Invalid node document - missing 'id' field")
+            return is_valid
+
+        # Relationship validation
+        if doc_type == "relationship":
+            start = doc.get("start", {})
+            end = doc.get("end", {})
+
+            # Check basic structure
+            is_valid = all(
+                [
+                    isinstance(start, dict),
+                    isinstance(end, dict),
+                    bool(start.get("id")),
+                    bool(end.get("id")),
+                ]
+            )
+
+            # Only check properties if they exist
+            if start.get("properties") is not None and not isinstance(
+                start.get("properties"), dict
+            ):
+                is_valid = False
+            if end.get("properties") is not None and not isinstance(
+                end.get("properties"), dict
+            ):
+                is_valid = False
+
+            if not is_valid:
+                logger.warning(
+                    "Invalid relationship document structure: %s",
+                    doc.get("id", "unknown"),
+                )
+            return is_valid
+
+        return False
+
+    except Exception as e:
+        logger.warning("Error validating document: %s", e)
+        return False
+
+
 def _process_node_document(
     doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
 ) -> int:
@@ -422,6 +491,10 @@ def _process_node_document(
         int: Number of nodes added
     """
     try:
+        # Validate document first
+        if not validate_document(doc):
+            return 0
+
         # For nodes, use id or _key as _key
         key = str(doc.get("id") or doc.get("_key"))
         if not key:
@@ -462,30 +535,16 @@ def _process_relationship_document(
         int: Number of edges added
     """
     try:
-        # Validate relationship document structure
-        if not isinstance(doc.get("start"), dict) or not isinstance(
-            doc.get("end"), dict
-        ):
-            logger.warning(
-                "Invalid relationship document - 'start' or 'end' not a dict: %s",
-                doc.get("id", "unknown"),
-            )
+        # Validate document first
+        if not validate_document(doc):
             return 0
 
         start = doc["start"]
         end = doc["end"]
-
-        # Validate start and end node IDs
-        if not start.get("id") or not end.get("id"):
-            logger.warning(
-                "Invalid relationship document - missing start or end node ID: %s",
-                doc.get("id", "unknown"),
-            )
-            return 0
-
-        # For edges, create edge document with _from and _to
         start_id: str = str(start["id"])
         end_id: str = str(end["id"])
+
+        # Create edge document
         edge_doc: dict[str, Any] = {
             "_from": f"Nodes/{start_id}",
             "_to": f"Nodes/{end_id}",
@@ -500,6 +559,7 @@ def _process_relationship_document(
         if progress_queue is not None:
             progress_queue.put((0, edges_added))
         return edges_added
+
     except KeyError as e:
         logger.warning(
             "Invalid relationship document - missing required field %s: %s",
@@ -603,8 +663,7 @@ def process_chunk(
                     try:
                         doc = json.loads(line)
                         # Validate document before processing
-                        if not (doc.get("type") in ["node", "edge"] and "_key" in doc):
-                            logger.warning(f"Invalid document format: {doc}")
+                        if not validate_document(doc):
                             continue
 
                         n_added, e_added = process_document(doc, db, progress_queue)
