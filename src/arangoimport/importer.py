@@ -276,7 +276,8 @@ def _process_jsonl(
 
 
 def split_json_file(
-    filename: str, chunk_size_mb: int = 100
+    filename: str | Path,
+    chunk_size_mb: int = 100,
 ) -> Generator[str, None, None]:
     """Split a large JSON file into smaller valid JSON files.
 
@@ -407,6 +408,84 @@ def process_chunk_data(
     return nodes_added, edges_added
 
 
+def _process_node_document(
+    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+) -> int:
+    """Process a node document.
+
+    Args:
+        doc: Node document to process
+        db: ArangoDatabase connection
+        progress_queue: Queue to report progress
+
+    Returns:
+        int: Number of nodes added
+    """
+    try:
+        # For nodes, use id or _key as _key
+        key = str(doc.get("id") or doc.get("_key"))
+        if not key:
+            logger.warning("Node document missing both 'id' and '_key' fields")
+            return 0
+
+        # Create node document with _key
+        node_doc: dict[str, Any] = {"_key": key}
+
+        # Copy all fields from the original document
+        for field, value in doc.items():
+            if field not in ["_key", "id"]:  # Don't duplicate key fields
+                node_doc[field] = value
+
+        nodes_added = batch_save_documents(db["Nodes"], [node_doc], 1)
+        if progress_queue is not None:
+            progress_queue.put((nodes_added, 0))
+        return nodes_added
+    except Exception as e:
+        if "unique constraint violated" in str(e):
+            logger.warning("Document with _key %s already exists, skipping...", key)
+        else:
+            logger.warning("Error processing node document: %s", e)
+        return 0
+
+
+def _process_relationship_document(
+    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+) -> int:
+    """Process a relationship document.
+
+    Args:
+        doc: Relationship document to process
+        db: ArangoDB database connection
+        progress_queue: Queue to report progress
+
+    Returns:
+        int: Number of edges added
+    """
+    try:
+        # For edges, create edge document with _from and _to
+        start_id: str = str(doc["start"]["id"])
+        end_id: str = str(doc["end"]["id"])
+        edge_doc: dict[str, Any] = {
+            "_from": f"Nodes/{start_id}",
+            "_to": f"Nodes/{end_id}",
+        }
+        # Copy all other properties except special fields
+        for key, value in doc.items():
+            if key not in ["_from", "_to", "type", "id", "start", "end"]:
+                edge_doc[key] = value
+
+        edges_added = batch_save_documents(db["Edges"], [edge_doc], 1)
+        if progress_queue is not None:
+            progress_queue.put((0, edges_added))
+        return edges_added
+    except Exception as e:
+        if "unique constraint violated" in str(e):
+            logger.warning("Edge document already exists, skipping...")
+        else:
+            logger.warning("Error processing edge document: %s", e)
+        return 0
+
+
 def process_document(
     doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
 ) -> tuple[int, int]:
@@ -420,46 +499,21 @@ def process_document(
     Returns:
         Tuple[int, int]: Number of nodes and edges added
     """
-    nodes_added = 0
-    edges_added = 0
+    nodes_added: int = 0
+    edges_added: int = 0
 
-    if "_key" not in doc:
-        logger.warning("Invalid document: missing _key field")
-        return nodes_added, edges_added
-
-    doc_type = doc.get("type", "").lower()
-    if doc_type == "node":
-        try:
-            nodes_added = batch_save_documents(db["Nodes"], [doc], 1)
-            if progress_queue is not None:
-                progress_queue.put(
-                    (nodes_added, 0)
-                )  # Report (nodes_added, edges_added)
-        except Exception as e:
-            logger.warning(f"Error processing node document: {e}")
-            nodes_added = 0
-    elif doc_type in ["edge", "relationship"]:
-        try:
-            edge_doc = doc
-            if doc_type == "relationship":
-                start_node = doc.get("start", {})
-                end_node = doc.get("end", {})
-                edge_doc = {
-                    "_from": f"Nodes/{start_node.get('id', '')}",
-                    "_to": f"Nodes/{end_node.get('id', '')}",
-                    "type": doc.get("label", ""),
-                    "properties": doc.get("properties", {}),
-                }
-            edges_added = batch_save_documents(db["Edges"], [edge_doc], 1)
-            if progress_queue is not None:
-                progress_queue.put(
-                    (0, edges_added)
-                )  # Report (nodes_added, edges_added)
-        except Exception as e:
-            logger.warning(f"Error processing edge document: {e}")
-            edges_added = 0
-    else:
-        logger.warning(f"Invalid document type: {doc_type}")
+    try:
+        doc_type: str = doc.get("type", "").lower()
+        if doc_type == "node":
+            nodes_added = _process_node_document(doc, db, progress_queue)
+        elif doc_type == "relationship":
+            edges_added = _process_relationship_document(doc, db, progress_queue)
+        else:
+            logger.warning("Invalid document type: %s", doc_type)
+    except KeyError as e:
+        logger.warning("Invalid document format - missing required field: %s", e)
+    except Exception as e:
+        logger.warning("Error processing document: %s", e)
 
     return nodes_added, edges_added
 
