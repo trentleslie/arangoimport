@@ -229,14 +229,13 @@ class ArangoConnection:
             sys_db = self.client.db(
                 "_system", username=self.username, password=self.password
             )
-            databases = sys_db.databases()
-
-            # Handle async/batch jobs
-            if isinstance(databases, AsyncJob | BatchJob):
-                databases = databases.result()
-
-            # Check if database exists in the list
-            return isinstance(databases, list) and db_name in databases
+            dbs = sys_db.databases()
+            if dbs is None:
+                return False
+            # If databases() returns an async job, get its result.
+            if hasattr(dbs, "result") and callable(dbs.result):
+                dbs = dbs.result()
+            return isinstance(dbs, list) and db_name in dbs
         except (ArangoClientError, ConnectionError) as e:
             logger.error(f"Error checking database existence: {e}")
             raise ArangoError(str(e)) from e
@@ -249,13 +248,13 @@ class ArangoConnection:
         """
         try:
             return self.pool.get_nowait()
-        except Empty:
+        except Empty as e:
             with self.lock:
                 if self.connections_created < self.pool_size:
                     self.connections_created += 1
                     return self._create_connection()
                 else:
-                    return self.pool.get()
+                    raise Exception("Connection pool is empty") from e
 
     def _create_connection(self) -> Database:
         """Create a new connection.
@@ -357,45 +356,54 @@ class ArangoConnection:
             # Rebuild indexes if they were disabled
             if collection_name in self.disabled_indexes:
                 for idx in self.disabled_indexes[collection_name]:
-                    idx_type = idx["type"]
-                    idx_fields = idx["fields"]
-                    if idx_type == "hash":
-                        collection.add_hash_index(
-                            fields=idx_fields,
-                            unique=idx.get("unique", False),
-                            sparse=idx.get("sparse", False),
-                        )
-                    elif idx_type == "skiplist":
-                        collection.add_skiplist_index(
-                            fields=idx_fields,
-                            unique=idx.get("unique", False),
-                            sparse=idx.get("sparse", False),
-                        )
-                    elif idx_type == "persistent":
-                        collection.add_persistent_index(
-                            fields=idx_fields,
-                            unique=idx.get("unique", False),
-                            sparse=idx.get("sparse", False),
-                        )
-                    elif idx_type == "ttl":
-                        collection.add_ttl_index(
-                            fields=idx_fields,
-                            expiry_time=idx.get("expiry_time", 0),
-                        )
-                    elif idx_type == "geo":
-                        collection.add_geo_index(
-                            fields=idx_fields,
-                            geo_json=idx.get("geo_json", False),
-                        )
-                    elif idx_type == "fulltext":
-                        collection.add_fulltext_index(
-                            fields=idx_fields,
-                            min_length=idx.get("min_length", None),
-                        )
-                    logger.info(f"Rebuilt index {idx['id']} in {collection_name}")
+                    try:
+                        idx_type = idx["type"]
+                        idx_fields = idx["fields"]
+                        if idx_type == "hash":
+                            collection.add_index(
+                                {
+                                    "type": "hash",
+                                    "fields": idx_fields,
+                                    "name": idx.get(
+                                        "name", f"{collection_name}_hash_index"
+                                    ),
+                                    "unique": idx.get("unique", False),
+                                    "sparse": idx.get("sparse", False),
+                                }
+                            )
+                        elif idx_type == "skiplist":
+                            collection.add_skiplist_index(
+                                fields=idx_fields,
+                                unique=idx.get("unique", False),
+                                sparse=idx.get("sparse", False),
+                            )
+                        elif idx_type == "persistent":
+                            collection.add_persistent_index(
+                                fields=idx_fields,
+                                unique=idx.get("unique", False),
+                                sparse=idx.get("sparse", False),
+                            )
+                        elif idx_type == "ttl":
+                            collection.add_ttl_index(
+                                fields=idx_fields,
+                                expiry_time=idx.get("expiry_time", 0),
+                            )
+                        elif idx_type == "geo":
+                            collection.add_geo_index(
+                                fields=idx_fields,
+                                geo_json=idx.get("geo_json", False),
+                            )
+                        elif idx_type == "fulltext":
+                            collection.add_fulltext_index(
+                                fields=idx_fields,
+                                min_length=idx.get("min_length", None),
+                            )
+                        logger.info(f"Rebuilt index {idx['id']} in {collection_name}")
+                    except ArangoServerError as e:
+                        raise ArangoError(f"Failed to rebuild index: {e}") from e
                 # Clear disabled indexes
                 del self.disabled_indexes[collection_name]
-        except ArangoClientError as e:
+        except Exception as e:
             logger.error(f"Error rebuilding collection indexes: {e}")
             raise ArangoError(str(e)) from e
 
