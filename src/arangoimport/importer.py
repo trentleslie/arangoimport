@@ -455,20 +455,42 @@ def _process_relationship_document(
 
     Args:
         doc: Relationship document to process
-        db: ArangoDB database connection
+        db: ArangoDatabase connection
         progress_queue: Queue to report progress
 
     Returns:
         int: Number of edges added
     """
     try:
+        # Validate relationship document structure
+        if not isinstance(doc.get("start"), dict) or not isinstance(
+            doc.get("end"), dict
+        ):
+            logger.warning(
+                "Invalid relationship document - 'start' or 'end' not a dict: %s",
+                doc.get("id", "unknown"),
+            )
+            return 0
+
+        start = doc["start"]
+        end = doc["end"]
+
+        # Validate start and end node IDs
+        if not start.get("id") or not end.get("id"):
+            logger.warning(
+                "Invalid relationship document - missing start or end node ID: %s",
+                doc.get("id", "unknown"),
+            )
+            return 0
+
         # For edges, create edge document with _from and _to
-        start_id: str = str(doc["start"]["id"])
-        end_id: str = str(doc["end"]["id"])
+        start_id: str = str(start["id"])
+        end_id: str = str(end["id"])
         edge_doc: dict[str, Any] = {
             "_from": f"Nodes/{start_id}",
             "_to": f"Nodes/{end_id}",
         }
+
         # Copy all other properties except special fields
         for key, value in doc.items():
             if key not in ["_from", "_to", "type", "id", "start", "end"]:
@@ -478,11 +500,26 @@ def _process_relationship_document(
         if progress_queue is not None:
             progress_queue.put((0, edges_added))
         return edges_added
+    except KeyError as e:
+        logger.warning(
+            "Invalid relationship document - missing required field %s: %s",
+            e,
+            doc.get("id", "unknown"),
+        )
+        return 0
     except Exception as e:
         if "unique constraint violated" in str(e):
-            logger.warning("Edge document already exists, skipping...")
+            logger.warning(
+                "Edge document already exists between %s and %s, skipping...",
+                start_id,
+                end_id,
+            )
         else:
-            logger.warning("Error processing edge document: %s", e)
+            logger.warning(
+                "Error processing edge document %s: %s",
+                doc.get("id", "unknown"),
+                e,
+            )
         return 0
 
 
