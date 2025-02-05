@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, TypedDict
 
@@ -27,25 +28,38 @@ EDGE_COLLECTION_TYPE = "edge"
 EDGE_COLLECTION_TYPE_ID = 3  # ArangoDB internal type ID for edge collections
 
 
-def ensure_collections(db: Database) -> None:
-    """Ensure required collections exist and are of correct type.
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
 
-    Args:
-        db: Database object
-    """
-    try:
-        # Create Nodes collection if it doesn't exist
-        if not db.has_collection("Nodes"):
-            db.create_collection("Nodes")
-            logger.info("Created Nodes collection")
+    max_retries: int
+    retry_delay: float
 
-        # Create Edges collection if it doesn't exist
-        if not db.has_collection("Edges"):
-            db.create_collection("Edges", edge=(EDGE_COLLECTION_TYPE == "edge"))
-            logger.info("Created Edges collection")
-    except CollectionCreateError as e:
-        logger.error(f"Error creating collections: {e}")
-        raise
+
+@dataclass
+class ImportConfig:
+    """Configuration for data import."""
+
+    host: str = "localhost"
+    port: int = 8529
+    username: str = "root"
+    password: str | None = None
+    db_name: str = "spoke_human"
+    processes: int = 4
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert config to dictionary.
+
+        Returns:
+            dict[str, Any]: Dictionary representation of config
+        """
+        return {
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "password": self.password,
+            "db_name": self.db_name,
+        }
 
 
 class ArangoConfig(TypedDict, total=False):
@@ -167,11 +181,37 @@ class ArangoConnection:
                 # Release lock
                 fcntl.flock(f, fcntl.LOCK_UN)
 
+    def _database_exists(self, db_name: str) -> bool:
+        """Check if a database exists.
+
+        Args:
+            db_name: Name of database to check
+
+        Returns:
+            bool: True if database exists, False otherwise
+        """
+        try:
+            sys_db = self.client.db(
+                "_system", username=self.username, password=self.password
+            )
+            dbs = sys_db.databases()
+
+            # Handle async/batch jobs
+            if hasattr(dbs, "result") and callable(dbs.result):
+                dbs = dbs.result()
+
+            return isinstance(dbs, list) and db_name in dbs
+
+        except Exception as e:
+            logger.error("Error checking database existence: %s", e)
+            return False
+
     def _init_pool(self) -> None:
         """Initialize connection pool."""
         try:
             # Create database if it doesn't exist
-            self.create_database(self.db_name)
+            if not self._database_exists(self.db_name):
+                self.create_database(self.db_name)
 
             # Initialize base connection
             self._base_connection = self.client.db(
@@ -225,20 +265,7 @@ class ArangoConnection:
         Raises:
             ArangoError: If checking database existence fails
         """
-        try:
-            sys_db = self.client.db(
-                "_system", username=self.username, password=self.password
-            )
-            dbs = sys_db.databases()
-            if dbs is None:
-                return False
-            # If databases() returns an async job, get its result.
-            if hasattr(dbs, "result") and callable(dbs.result):
-                dbs = dbs.result()
-            return isinstance(dbs, list) and db_name in dbs
-        except (ArangoClientError, ConnectionError) as e:
-            logger.error(f"Error checking database existence: {e}")
-            raise ArangoError(str(e)) from e
+        return self._database_exists(db_name)
 
     def _get_connection(self) -> Database:
         """Get a connection from the pool.
@@ -510,3 +537,24 @@ class ArangoError(Exception):
     """
 
     pass
+
+
+def ensure_collections(db: Database) -> None:
+    """Ensure required collections exist and are of correct type.
+
+    Args:
+        db: Database object
+    """
+    try:
+        # Create Nodes collection if it doesn't exist
+        if not db.has_collection("Nodes"):
+            db.create_collection("Nodes")
+            logger.info("Created Nodes collection")
+
+        # Create Edges collection if it doesn't exist
+        if not db.has_collection("Edges"):
+            db.create_collection("Edges", edge=(EDGE_COLLECTION_TYPE == "edge"))
+            logger.info("Created Edges collection")
+    except CollectionCreateError as e:
+        logger.error(f"Error creating collections: {e}")
+        raise
