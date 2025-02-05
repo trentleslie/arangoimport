@@ -1,10 +1,12 @@
 """Command line interface for arangoimport."""
 
+import os
+from typing import Any
+
 import click
 from rich.console import Console
 
-from .connection import ArangoConfig
-from .importer import parallel_load_data
+from .importer import ImportConfig, parallel_load_data
 from .logging import get_logger, setup_logging
 
 console = Console()
@@ -20,50 +22,46 @@ def cli() -> None:
 
 @cli.command()
 @click.argument("file_path", type=click.Path(exists=True))
-@click.option("--db-name", default="spoke_human", help="Database name")
+@click.option("--host", default="localhost", help="ArangoDB host")
+@click.option("--port", type=int, default=8529, help="ArangoDB port")
 @click.option(
     "--username", envvar="ARANGO_USER", default="root", help="Database username"
 )
 @click.option(
     "--password", envvar="ARANGO_PASSWORD", required=True, help="Database password"
 )
+@click.option("--db-name", default="spoke_human", help="Database name")
 @click.option(
     "--processes", type=int, help="Number of processes to use (default: CPU count - 1)"
 )
-@click.option("--host", default="localhost", help="ArangoDB host")
-@click.option("--port", type=int, default=8529, help="ArangoDB port")
-def import_data(
-    file_path: str,
-    **kwargs: str | int,
-) -> None:
+def import_data(file_path: str, **kwargs: Any) -> None:
     """Import data from a file into ArangoDB.
 
     Args:
-        file_path: Path to the input file
-        **kwargs: Additional configuration options including:
-            - db_name: Target database name
-            - username: Database username
-            - password: Database password
-            - processes: Number of processes to use
-            - host: ArangoDB host
-            - port: ArangoDB port
+        file_path: Path to input file
+        **kwargs: Additional configuration options
     """
-    try:
-        # Extract and type-cast processes
-        processes = kwargs.pop("processes", None)
-        num_processes: int | None = int(processes) if processes is not None else None
+    if not kwargs.get("password"):
+        raise ValueError("Password is required")
 
-        # Create database configuration
-        db_config = ArangoConfig(
-            host=str(kwargs.get("host", "localhost")),
-            port=int(kwargs.get("port", 8529)),
-            username=str(kwargs.get("username", "root")),
-            password=str(kwargs["password"]),
-            db_name=str(kwargs.get("db_name", "spoke_human")),
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    try:
+        # Create import configuration
+        config = ImportConfig(
+            host=kwargs.get("host", "localhost"),
+            port=kwargs.get("port", 8529),
+            username=kwargs.get("username", "root"),
+            password=kwargs["password"],
+            db_name=kwargs.get("db_name", "spoke_human"),
+            processes=kwargs.get("processes", 4),
         )
 
         nodes_added, edges_added = parallel_load_data(
-            file_path, dict(db_config), num_processes=num_processes
+            file_path,
+            config.to_dict(),
+            processes=config.processes,
         )
 
         console.print("[green]Import successfully completed![/green]")
