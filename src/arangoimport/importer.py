@@ -393,24 +393,15 @@ def process_chunk_data(
     if nodes:
         logger.info(f"Processing {len(nodes)} nodes...")
         try:
-            # Get node processor factory
-            from .node_processors import NodeProcessorFactory
-            processor_factory = NodeProcessorFactory()
-            
-            # Process nodes with type-specific validation and transformation
+            # Process and validate nodes
             valid_nodes = []
             for node in nodes:
                 if not isinstance(node, dict) or node.get("type") != "node":
                     continue
                     
-                # Get appropriate processor for node type
-                node_type = node.get("labels", [""])[0]
-                processor = processor_factory.get_processor(node_type)
-                
-                # Process node
-                processed = processor.process_node(node)
-                if processed:
-                    valid_nodes.append(processed)
+                # Validate node
+                if validate_document(node):
+                    valid_nodes.append(node)
             if valid_nodes:
                 try:
                     batch_added = batch_save_documents(nodes_col, valid_nodes, batch_size)
