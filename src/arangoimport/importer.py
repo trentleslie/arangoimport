@@ -14,11 +14,9 @@ from arango.collection import Collection
 from arango.database import Database as ArangoDatabase
 from arango.response import Response
 
-from arangoimport.connection import ArangoConnection
-from arangoimport.logging import get_logger
-from arangoimport.utils import (
-    retry_with_backoff,
-)
+from .connection import ArangoConnection
+from .logging import get_logger
+from .utils import retry_with_backoff
 
 logger = get_logger(__name__)
 
@@ -590,7 +588,7 @@ def process_document(
 
     Args:
         doc: Document to process
-        db: ArangoDB database connection
+        db: ArangoDatabase connection
         progress_queue: Queue to report progress
 
     Returns:
@@ -616,68 +614,83 @@ def process_document(
 
 
 def process_chunk(
-    filename: str | Path,
+    file_path: str,
     db_config: dict[str, Any],
-    chunk_number: int,
-    total_chunks: int,
-    progress_queue: Any | None = None,
+    start_pos: int,
+    end_pos: int,
+    progress_queue: queue.Queue[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
-    """Process a chunk of the file and insert into database.
+    """Process a chunk of data from a file.
 
     Args:
-        filename: Path to the input file
+        file_path: Path to file to process
         db_config: Database configuration
-        chunk_number: Current chunk number
-        total_chunks: Total number of chunks
+        start_pos: Start position in file
+        end_pos: End position in file
         progress_queue: Queue to report progress
 
     Returns:
-        Tuple[int, int]: Number of nodes and edges added
+        tuple[int, int]: Number of nodes and edges added
     """
-    logger.info(f"Processing chunk {chunk_number + 1}/{total_chunks}")
     nodes_added = 0
     edges_added = 0
 
     try:
-        with ArangoConnection(**db_config).get_connection() as db:
-            ensure_collections(db)
+        connection = ArangoConnection(**db_config)
+        with connection.get_connection() as db:
+            try:
+                # Ensure collections exist
+                collection_names = set()
+                collections = db.collections()
+                if hasattr(collections, "result") and callable(
+                    collections.result
+                ):
+                    collections = collections.result()
+                if isinstance(collections, list):
+                    for collection in collections:
+                        if isinstance(collection, dict) and "name" in collection:
+                            collection_names.add(collection["name"])
 
-            # Calculate chunk bounds
-            file_size = os.path.getsize(filename)
-            chunk_size = file_size // total_chunks
-            start = chunk_number * chunk_size
-            end = start + chunk_size if chunk_number < total_chunks - 1 else file_size
+                if "Nodes" not in collection_names:
+                    logger.info("Creating Nodes collection...")
+                    db.create_collection("Nodes")
+                if "Edges" not in collection_names:
+                    logger.info("Creating Edges collection...")
+                    db.create_collection("Edges", edge=True)
 
-            # Process the chunk
-            with open(filename, "rb") as f:
-                f.seek(start)
-                # Read to the next newline if not at the start
-                if start > 0:
-                    f.readline()
+                # Process documents
+                with open(file_path, encoding="utf-8") as f:
+                    f.seek(start_pos)
+                    # Read to the next newline if not at the start
+                    if start_pos > 0:
+                        f.readline()
 
-                while f.tell() < end:
-                    line = f.readline().decode("utf-8").strip()
-                    if not line:
-                        continue
-
-                    try:
-                        doc = json.loads(line)
-                        # Validate document before processing
-                        if not validate_document(doc):
+                    while f.tell() < end_pos:
+                        line = f.readline().strip()
+                        if not line:
                             continue
 
-                        n_added, e_added = process_document(doc, db, progress_queue)
-                        nodes_added += n_added
-                        edges_added += e_added
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON in line: {line[:100]}...")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error processing document: {e}")
-                        continue
+                        try:
+                            doc = json.loads(line)
+                            # Validate document before processing
+                            if not validate_document(doc):
+                                continue
+
+                            n_added, e_added = process_document(doc, db, progress_queue)
+                            nodes_added += n_added
+                            edges_added += e_added
+                        except json.JSONDecodeError:
+                            logger.warning("Invalid JSON in line: %s...", line[:100])
+                        except Exception as e:
+                            logger.warning("Error processing document: %s", e)
+
+            except Exception as e:
+                logger.error("Error processing documents: %s", e)
+                raise
 
     except Exception as e:
-        logger.error(f"Error processing chunk {chunk_number}: {e}")
+        logger.error("Error connecting to database: %s", e)
+        raise
 
     return nodes_added, edges_added
 
@@ -710,79 +723,51 @@ def get_db_max_connections(db: ArangoDatabase) -> int:
 
 
 def parallel_load_data(
-    file_path: str | Path,
+    filename: str | Path,
     db_config: dict[str, Any],
-    num_processes: int | None = None,
-    max_processes: int | None = None,
+    processes: int = 4,
+    progress_queue: queue.Queue[tuple[int, int]] | None = None,
 ) -> tuple[int, int]:
-    """Load data from a JSON file in parallel.
+    """Load data in parallel using multiple processes.
 
     Args:
-        file_path: Path to JSON file
+        filename: Path to input file
         db_config: Database configuration
-        num_processes: Number of processes to use. Defaults to CPU count - 1
-            up to max_processes limit.
-        max_processes: Maximum number of processes to use. Defaults to CPU count.
-            Higher values speed up processing but use more resources.
-            Lower values are more stable but slower.
+        processes: Number of processes to use
+        progress_queue: Queue to report progress
 
     Returns:
-        Tuple[int, int]: Number of nodes and edges added
+        tuple[int, int]: Number of nodes and edges added
     """
-    file_path = str(file_path)
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    logger.info(f"Starting import with {processes} processes")
+    file_size = os.path.getsize(filename)
+    chunk_size = file_size // processes
 
-    # Determine number of processes
-    if max_processes is None:
-        max_processes = multiprocessing.cpu_count()
+    # Create process pool and tasks
+    with multiprocessing.Pool(processes=processes) as pool:
+        tasks = []
+        for i in range(processes):
+            start = i * chunk_size
+            end = start + chunk_size if i < processes - 1 else file_size
+            logger.info(f"Processing chunk {i + 1}/{processes}")
 
-    if num_processes is None:
-        num_processes = min(multiprocessing.cpu_count() - 1, max_processes)
-    else:
-        num_processes = min(num_processes, max_processes)
+            task = pool.apply_async(
+                process_chunk,
+                (
+                    filename,
+                    db_config,
+                    start,
+                    end,
+                    progress_queue,
+                ),
+            )
+            tasks.append(task)
 
-    # Create a manager for shared resources
-    with multiprocessing.Manager() as manager:
-        # Create a queue for progress tracking
-        progress_queue = manager.Queue()
+        # Wait for all tasks to complete
+        results = [task.get() for task in tasks]
 
-        # Create process pool and distribute chunks
-        logger.info(f"Starting import with {num_processes} processes")
-        total_nodes_added = 0
-        total_edges_added = 0
-        nodes_processed = 0
-        edges_processed = 0
+    # Sum up results
+    total_nodes = sum(r[0] for r in results)
+    total_edges = sum(r[1] for r in results)
 
-        with multiprocessing.Pool(num_processes) as pool:
-            # Create chunk arguments
-            chunk_args = [
-                (file_path, db_config, i, num_processes, progress_queue)
-                for i in range(num_processes)
-            ]
-
-            # Start processing chunks
-            results = pool.starmap_async(process_chunk, chunk_args)
-
-            # Monitor progress while chunks are being processed
-            while not results.ready():
-                try:
-                    doc_type, count = progress_queue.get(timeout=1)
-                    if doc_type == "node":
-                        nodes_processed += count
-                        logger.info(f"Nodes processed: {nodes_processed:,}")
-                    else:
-                        edges_processed += count
-                        logger.info(f"Edges processed: {edges_processed:,}")
-                except queue.Empty:
-                    continue
-
-            # Get final results
-            chunk_results = results.get()
-            for nodes, edges in chunk_results:
-                total_nodes_added += nodes
-                total_edges_added += edges
-
-    msg = "Import complete. Added {:,} nodes and {:,} edges"
-    logger.info(msg.format(total_nodes_added, total_edges_added))
-    return total_nodes_added, total_edges_added
+    return total_nodes, total_edges
