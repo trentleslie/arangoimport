@@ -5,9 +5,12 @@ import multiprocessing
 import os
 import queue
 import tempfile
+import time
 from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Optional
+from .config import ImportConfig
+from .monitoring import ImportMonitor, ImportStats
 
 import ijson
 from arango.collection import Collection
@@ -52,9 +55,8 @@ def _handle_import_bulk_result(result: Any) -> int:
         return 1  # Fallback assuming success
 
 
-@retry_with_backoff(max_retries=3)
 def batch_save_documents(
-    collection: Any, docs: list[dict[str, Any]], batch_size: int
+    collection: Collection, docs: list[dict[str, Any]], batch_size: int
 ) -> int:
     """Save documents in batches.
 
@@ -70,7 +72,7 @@ def batch_save_documents(
         AttributeError: If collection is None or has no bulk insertion method
         Exception: If batch save operation fails after retries
     """
-    if not collection:
+    if collection is None:
         raise AttributeError("Collection cannot be None")
 
     if not docs:
@@ -79,9 +81,8 @@ def batch_save_documents(
     if not (hasattr(collection, "import_bulk") or hasattr(collection, "bulkSave")):
         raise AttributeError("Collection must have import_bulk or bulkSave method")
 
-    total_saved = 0
-    for i in range(0, len(docs), batch_size):
-        batch = docs[i : i + batch_size]
+    @retry_with_backoff(max_retries=3)
+    def _save_batch(batch: list[dict[str, Any]]) -> int:
         # Prefer import_bulk if its side_effect is explicitly set
         # (as in process_chunk_data tests), otherwise use bulkSave
         # (as expected in batch_save_documents tests).
@@ -100,7 +101,12 @@ def batch_save_documents(
                     f"bulkSave failed with error: {e!s}, falling back to import_bulk"
                 )
                 result = collection.import_bulk(batch)
-        total_saved += _handle_import_bulk_result(result)
+        return _handle_import_bulk_result(result)
+
+    total_saved = 0
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i : i + batch_size]
+        total_saved += _save_batch(batch)
 
     return total_saved
 
@@ -253,14 +259,20 @@ def _process_jsonl(
                 if item_type == "relationship":
                     start_node = item.get("start", {})
                     end_node = item.get("end", {})
+                    start_id = str(start_node.get("id", ""))
+                    end_id = str(end_node.get("id", ""))
                     edge_doc = {
-                        "_from": f"Nodes/{start_node.get('id', '')}",
-                        "_to": f"Nodes/{end_node.get('id', '')}",
-                        "type": item.get("label", ""),
-                        "properties": item.get("properties", {}),
+                        "_key": f"{item.get('id', '')}_{start_id}_{end_id}",
+                        "_from": f"Nodes/{start_id}",
+                        "_to": f"Nodes/{end_id}",
                     }
+                    # Copy all other properties except special fields
+                    for key, value in item.items():
+                        if key not in ["_key", "_from", "_to", "type", "id", "start", "end"]:
+                            edge_doc[key] = value
                     current_chunk["edges"].append(edge_doc)
                 else:
+                    # For pre-formatted edge documents
                     current_chunk["edges"].append(item)
             current_size += item_size
 
@@ -331,19 +343,33 @@ def ensure_collections(db: ArangoDatabase) -> None:
         db: ArangoDB database connection
     """
     collections = db.collections()
-    if isinstance(collections, list | dict):
-        collection_names = [c["name"] for c in collections]
-    else:
-        collection_names = []
+    if hasattr(collections, "result") and callable(collections.result):
+        collections = collections.result()
 
-    if "Nodes" not in collection_names:
-        db.create_collection("Nodes")
-    if "Edges" not in collection_names:
-        db.create_collection("Edges", edge=True)
+    if isinstance(collections, (list, dict)):
+        collection_names = {c["name"] if isinstance(c, dict) else c for c in collections}
+    else:
+        collection_names = set(collections)
+
+    # Create collections if they don't exist
+    try:
+        if "Nodes" not in collection_names:
+            logger.info("Creating Nodes collection...")
+            db.create_collection("Nodes")
+        if "Edges" not in collection_names:
+            logger.info("Creating Edges collection...")
+            db.create_collection("Edges", edge=True)
+    except Exception as e:
+        if "duplicate" not in str(e).lower():
+            raise
 
 
 def process_chunk_data(
-    db: ArangoDatabase, chunk_data: dict[str, Any], batch_size: int
+    db: ArangoDatabase,
+    chunk_data: dict[str, Any],
+    batch_size: int,
+    config: Optional[ImportConfig] = None,
+    monitor: Optional[ImportMonitor] = None
 ) -> tuple[int, int]:
     """Process chunk data and insert into database.
 
@@ -357,6 +383,7 @@ def process_chunk_data(
     """
     nodes_added = 0
     edges_added = 0
+    stats = ImportStats()
 
     nodes_col = db["Nodes"]
     edges_col = db["Edges"]
@@ -366,42 +393,106 @@ def process_chunk_data(
     if nodes:
         logger.info(f"Processing {len(nodes)} nodes...")
         try:
-            # Filter out invalid nodes
-            valid_nodes = [
-                node
-                for node in nodes
-                if isinstance(node, dict)
-                and "_key" in node
-                and node.get("type") == "node"
-            ]
+            # Get node processor factory
+            from .node_processors import NodeProcessorFactory
+            processor_factory = NodeProcessorFactory()
+            
+            # Process nodes with type-specific validation and transformation
+            valid_nodes = []
+            for node in nodes:
+                if not isinstance(node, dict) or node.get("type") != "node":
+                    continue
+                    
+                # Get appropriate processor for node type
+                node_type = node.get("labels", [""])[0]
+                processor = processor_factory.get_processor(node_type)
+                
+                # Process node
+                processed = processor.process_node(node)
+                if processed:
+                    valid_nodes.append(processed)
             if valid_nodes:
-                nodes_added = batch_save_documents(nodes_col, valid_nodes, batch_size)
-                logger.info(f"Added {nodes_added} of {len(nodes)} nodes")
+                try:
+                    batch_added = batch_save_documents(nodes_col, valid_nodes, batch_size)
+                    nodes_added += batch_added
+                    stats.processed += batch_added
+                    logger.info(f"Added {batch_added} of {len(nodes)} nodes")
+                except Exception as e:
+                    logger.error(f"Error processing node batch: {e}")
+                    stats.errors.append({"error": str(e), "count": len(valid_nodes)})
+                    stats.skipped += len(valid_nodes)
             else:
                 logger.warning("No valid nodes found")
         except Exception as e:
-            logger.warning(f"Error processing nodes: {e}")
+            logger.error(f"Error processing nodes: {e}")
+            stats.errors.append({"error": str(e), "count": len(nodes)})
+            stats.skipped += len(nodes)
 
     # Process edges in batches
     edges = chunk_data.get("edges", [])
     if edges:
         logger.info(f"Processing {len(edges)} edges...")
         try:
+            # Log a sample of raw edges
+            sample_size = min(3, len(edges))
+            logger.debug(f"Sample of raw edges before filtering: {edges[:sample_size]}")
+            
             # Filter out invalid edges
-            valid_edges = [
-                edge
-                for edge in edges
-                if isinstance(edge, dict)
-                and "_key" in edge
-                and edge.get("type") in ["edge", "relationship"]
-            ]
+            valid_edges = []
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    logger.debug(f"Skipping non-dict edge: {edge}")
+                    continue
+                    
+                edge_type = edge.get("type")
+                if edge_type not in ["edge", "relationship"]:
+                    logger.debug(f"Skipping edge with invalid type: {edge_type}")
+                    continue
+                    
+                # Check for required fields
+                if "_key" in edge and "_from" in edge and "_to" in edge:
+                    logger.debug(f"Found edge with _key format: {edge}")
+                    valid_edges.append(edge)
+                elif "start" in edge and "end" in edge:
+                    logger.debug(f"Found edge with start/end format: {edge}")
+                    valid_edges.append(edge)
+                else:
+                    logger.debug(f"Skipping edge missing required fields: {edge}")
+                    
+            logger.debug(f"Found {len(valid_edges)} valid edges out of {len(edges)} total")
+            
             if valid_edges:
-                edges_added = batch_save_documents(edges_col, valid_edges, batch_size)
-                logger.info(f"Added {edges_added} of {len(edges)} edges")
+                try:
+                    # Log the first few edges we're trying to save
+                    sample_size = min(3, len(valid_edges))
+                    logger.debug(f"Attempting to save edges: {valid_edges[:sample_size]}")
+                    
+                    batch_added = batch_save_documents(edges_col, valid_edges, batch_size)
+                    edges_added += batch_added
+                    stats.processed += batch_added
+                    logger.info(f"Added {batch_added} of {len(edges)} edges")
+                except Exception as e:
+                    logger.error(f"Error processing edge batch: {e}")
+                    logger.error(f"Failed edges sample: {valid_edges[:sample_size]}")
+                    stats.errors.append({"error": str(e), "count": len(valid_edges)})
+                    stats.skipped += len(valid_edges)
             else:
-                logger.warning("No valid edges found")
+                logger.warning("No valid edges found - Check that edges have either (start,end) or (_from,_to) fields)")
         except Exception as e:
-            logger.warning(f"Error processing edges: {e}")
+            logger.error(f"Error processing edges: {e}")
+            stats.errors.append({"error": str(e), "count": len(edges)})
+            stats.skipped += len(edges)
+
+    # Log progress
+    if monitor:
+        monitor.log_progress(stats)
+
+    # Check error threshold
+    if config and stats.error_rate > config.error_threshold:
+        raise ValueError(
+            f"Error rate {stats.error_rate:.2%} exceeds threshold "
+            f"{config.error_threshold:.2%}"
+        )
 
     return nodes_added, edges_added
 
@@ -438,28 +529,34 @@ def validate_document(doc: dict[str, Any]) -> bool:
 
         # Relationship validation
         if doc_type == "relationship":
-            start = doc.get("start", {})
-            end = doc.get("end", {})
+            if "start" in doc and "end" in doc:
+                start = doc["start"]
+                end = doc["end"]
+                # Check basic structure
+                is_valid = all(
+                    [
+                        isinstance(start, dict),
+                        isinstance(end, dict),
+                        bool(start.get("id")),
+                        bool(end.get("id")),
+                    ]
+                )
 
-            # Check basic structure
-            is_valid = all(
-                [
-                    isinstance(start, dict),
-                    isinstance(end, dict),
-                    bool(start.get("id")),
-                    bool(end.get("id")),
-                ]
-            )
-
-            # Only check properties if they exist
-            if start.get("properties") is not None and not isinstance(
-                start.get("properties"), dict
-            ):
-                is_valid = False
-            if end.get("properties") is not None and not isinstance(
-                end.get("properties"), dict
-            ):
-                is_valid = False
+                # Only check properties if they exist
+                if start.get("properties") is not None and not isinstance(
+                    start.get("properties"), dict
+                ):
+                    is_valid = False
+                if end.get("properties") is not None and not isinstance(
+                    end.get("properties"), dict
+                ):
+                    is_valid = False
+            elif "_from" in doc and "_to" in doc:
+                # Check that _from and _to are valid strings with a '/'
+                is_valid = (
+                    isinstance(doc["_from"], str) and "/" in doc["_from"]
+                    and isinstance(doc["_to"], str) and "/" in doc["_to"]
+                )
 
             if not is_valid:
                 logger.warning(
@@ -476,7 +573,7 @@ def validate_document(doc: dict[str, Any]) -> bool:
 
 
 def _process_node_document(
-    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+    doc: dict[str, Any], nodes_col: Collection, progress_queue: Optional[queue.Queue[tuple[int, int]]] = None
 ) -> int:
     """Process a node document.
 
@@ -507,7 +604,7 @@ def _process_node_document(
             if field not in ["_key", "id"]:  # Don't duplicate key fields
                 node_doc[field] = value
 
-        nodes_added = batch_save_documents(db["Nodes"], [node_doc], 1)
+        nodes_added = batch_save_documents(nodes_col, [node_doc], 1)
         if progress_queue is not None:
             progress_queue.put((nodes_added, 0))
         return nodes_added
@@ -520,7 +617,7 @@ def _process_node_document(
 
 
 def _process_relationship_document(
-    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+    doc: dict[str, Any], edges_col: Collection, progress_queue: Optional[queue.Queue[tuple[int, int]]] = None
 ) -> int:
     """Process a relationship document.
 
@@ -537,13 +634,19 @@ def _process_relationship_document(
         if not validate_document(doc):
             return 0
 
-        start = doc["start"]
-        end = doc["end"]
-        start_id: str = str(start["id"])
-        end_id: str = str(end["id"])
+        if "start" in doc and "end" in doc:
+            start = doc["start"]
+            end = doc["end"]
+            start_id: str = str(start["id"])
+            end_id: str = str(end["id"])
+        else:
+            # Assume the document has _from and _to in the form "Nodes/<id>"
+            start_id = doc["_from"].split("/", 1)[1] if "_from" in doc else ""
+            end_id = doc["_to"].split("/", 1)[1] if "_to" in doc else ""
 
-        # Create edge document
+        # Create edge document with unique _key
         edge_doc: dict[str, Any] = {
+            "_key": f"{doc.get('id', '')}_{start_id}_{end_id}",
             "_from": f"Nodes/{start_id}",
             "_to": f"Nodes/{end_id}",
         }
@@ -553,7 +656,7 @@ def _process_relationship_document(
             if key not in ["_from", "_to", "type", "id", "start", "end"]:
                 edge_doc[key] = value
 
-        edges_added = batch_save_documents(db["Edges"], [edge_doc], 1)
+        edges_added = batch_save_documents(edges_col, [edge_doc], 1)
         if progress_queue is not None:
             progress_queue.put((0, edges_added))
         return edges_added
@@ -582,13 +685,14 @@ def _process_relationship_document(
 
 
 def process_document(
-    doc: dict[str, Any], db: ArangoDatabase, progress_queue: Any | None = None
+    doc: dict[str, Any], nodes_col: Collection, edges_col: Collection, progress_queue: Optional[queue.Queue[tuple[int, int]]] = None
 ) -> tuple[int, int]:
     """Process a single document and save to database.
 
     Args:
         doc: Document to process
-        db: ArangoDatabase connection
+        nodes_col: Collection to save nodes to
+        edges_col: Collection to save edges to
         progress_queue: Queue to report progress
 
     Returns:
@@ -598,11 +702,19 @@ def process_document(
     edges_added: int = 0
 
     try:
+        # Verify collections are not None
+        if nodes_col is None:
+            logger.error("Nodes collection is None")
+            return 0, 0
+        if edges_col is None:
+            logger.error("Edges collection is None")
+            return 0, 0
+
         doc_type: str = doc.get("type", "").lower()
         if doc_type == "node":
-            nodes_added = _process_node_document(doc, db, progress_queue)
+            nodes_added = _process_node_document(doc, nodes_col, progress_queue)
         elif doc_type == "relationship":
-            edges_added = _process_relationship_document(doc, db, progress_queue)
+            edges_added = _process_relationship_document(doc, edges_col, progress_queue)
         else:
             logger.warning("Invalid document type: %s", doc_type)
     except KeyError as e:
@@ -613,12 +725,83 @@ def process_document(
     return nodes_added, edges_added
 
 
+def _get_collection_with_retry(
+    db: ArangoDatabase,
+    collection_name: str,
+    max_retries: int = 3,
+    retry_delay: float = 1.0,
+    initial_delay: float = 1.0
+) -> Collection:
+    """Get a collection with retry logic.
+
+    Args:
+        db: ArangoDB database connection
+        collection_name: Name of collection to get
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+
+    Returns:
+        Collection: The requested ArangoDB collection
+
+    Raises:
+        ValueError: If collection cannot be obtained after retries
+    """
+    collection: Optional[Collection] = None
+    retry_count = 0
+    last_error = None
+
+    # Add initial delay to ensure collection is ready
+    time.sleep(initial_delay)
+
+    while retry_count < max_retries:
+        try:
+            # First check if collection exists
+            collections = {c["name"]: c for c in db.collections()}
+            
+            if collection_name not in collections:
+                # Create collection if it doesn't exist
+                logger.info(f"Creating collection {collection_name}...")
+                if collection_name == "Edges":
+                    db.create_collection(collection_name, edge=True)
+                else:
+                    db.create_collection(collection_name)
+                time.sleep(retry_delay)  # Wait for collection to be ready
+            collection = db.collection(collection_name)
+
+            if collection is None:
+                raise ValueError(f"Collection {collection_name} not found or could not be created")
+
+            # Verify collection is fully accessible by attempting to get properties
+            _ = collection.properties()
+            logger.info(f"Successfully verified collection {collection_name}")
+            return collection
+
+        except Exception as e:
+            retry_count += 1
+            last_error = e
+            if retry_count < max_retries:
+                logger.warning(
+                    f"Failed to get/create {collection_name} collection "
+                    f"(attempt {retry_count}/{max_retries}): {e}"
+                )
+                time.sleep(retry_delay * (2 ** retry_count))  # Exponential backoff
+            
+    error_msg = f"Failed to get/create {collection_name} collection after {max_retries} retries"
+    if last_error:
+        error_msg += f": {last_error}"
+    raise ValueError(error_msg)
+
+
 def process_chunk(
     file_path: str,
     db_config: dict[str, Any],
     start_pos: int,
     end_pos: int,
     progress_queue: queue.Queue[tuple[int, int]] | None = None,
+    import_config: Optional[ImportConfig] = None,
+    monitor: Optional[ImportMonitor] = None,
+    retry_attempts: int = 5,  # Increase retry attempts
+    retry_delay: float = 2.0,  # Increase retry delay
 ) -> tuple[int, int]:
     """Process a chunk of data from a file.
 
@@ -628,35 +811,56 @@ def process_chunk(
         start_pos: Start position in file
         end_pos: End position in file
         progress_queue: Queue to report progress
+        import_config: Optional configuration for import settings and validation
+        monitor: Optional monitor for tracking progress and quality
 
     Returns:
         tuple[int, int]: Number of nodes and edges added
     """
     nodes_added = 0
     edges_added = 0
+    max_retries = 3
+    retry_count = 0
+    retry_delay = 1.0
 
-    try:
-        connection = ArangoConnection(**db_config)
-        with connection.get_connection() as db:
-            try:
-                # Ensure collections exist
-                collection_names = set()
-                collections = db.collections()
-                if hasattr(collections, "result") and callable(
-                    collections.result
-                ):
-                    collections = collections.result()
-                if isinstance(collections, list):
-                    for collection in collections:
-                        if isinstance(collection, dict) and "name" in collection:
-                            collection_names.add(collection["name"])
-
-                if "Nodes" not in collection_names:
-                    logger.info("Creating Nodes collection...")
-                    db.create_collection("Nodes")
-                if "Edges" not in collection_names:
-                    logger.info("Creating Edges collection...")
-                    db.create_collection("Edges", edge=True)
+    while retry_count < retry_attempts:
+        try:
+            logger.info(f"Worker initializing with database: {db_config['db_name']} (attempt {retry_count + 1}/{retry_attempts})")
+            
+            # Create a dedicated connection pool for this worker with improved settings
+            connection = ArangoConnection(
+                host=db_config["host"],
+                port=db_config["port"],
+                username=db_config["username"],
+                password=db_config["password"],
+                db_name=db_config["db_name"],
+                pool_size=2,
+                max_retries=5,
+                retry_delay=retry_delay
+            )
+            
+            # Get a connection to the database
+            with connection.get_connection() as db:
+                # Verify we can access the database by listing collections
+                try:
+                    _ = db.collections()
+                except Exception as e:
+                    raise ValueError(f"Cannot access database {db_config['db_name']}: {e}")
+                    
+                # Get collections with increased retry parameters
+                nodes_col = _get_collection_with_retry(db, "Nodes", max_retries=5, retry_delay=retry_delay, initial_delay=retry_delay)
+                if nodes_col is None:
+                    raise ValueError("Failed to get Nodes collection")
+                    
+                edges_col = _get_collection_with_retry(db, "Edges", max_retries=5, retry_delay=retry_delay, initial_delay=retry_delay)
+                if edges_col is None:
+                    raise ValueError("Failed to get Edges collection")
+                
+                # Verify collections are still accessible
+                nodes_col.properties()
+                edges_col.properties()
+                
+                logger.info(f"Worker: Collections verified in database {db_config['db_name']}")
 
                 # Process documents
                 with open(file_path, encoding="utf-8") as f:
@@ -664,6 +868,40 @@ def process_chunk(
                     # Read to the next newline if not at the start
                     if start_pos > 0:
                         f.readline()
+
+                    # Initialize batches
+                    node_batch: list[dict[str, Any]] = []
+                    edge_batch: list[dict[str, Any]] = []
+                    batch_size = 1000  # Process in larger batches for better performance
+
+                    def flush_node_batch():
+                        nonlocal nodes_added, node_batch
+                        if node_batch:
+                            try:
+                                batch_save_documents(nodes_col, node_batch, batch_size)
+                                nodes_added += len(node_batch)
+                                if progress_queue is not None:
+                                    progress_queue.put((len(node_batch), 0))
+                            except Exception as e:
+                                logger.warning(f"Error processing node batch: {e}")
+                            node_batch = []
+
+                    def flush_edge_batch():
+                        nonlocal edges_added, edge_batch
+                        if edge_batch:
+                            try:
+                                logger.debug(f"Attempting to save {len(edge_batch)} edges")
+                                sample_size = min(3, len(edge_batch))
+                                logger.debug(f"Sample of edges to save: {edge_batch[:sample_size]}")
+                                batch_save_documents(edges_col, edge_batch, batch_size)
+                                edges_added += len(edge_batch)
+                                logger.debug(f"Successfully saved {len(edge_batch)} edges")
+                                if progress_queue is not None:
+                                    progress_queue.put((0, len(edge_batch)))
+                            except Exception as e:
+                                logger.error(f"Error processing edge batch: {e}")
+                                logger.error(f"Failed edges sample: {edge_batch[:sample_size]}")
+                            edge_batch = []
 
                     while f.tell() < end_pos:
                         line = f.readline().strip()
@@ -676,23 +914,58 @@ def process_chunk(
                             if not validate_document(doc):
                                 continue
 
-                            n_added, e_added = process_document(doc, db, progress_queue)
-                            nodes_added += n_added
-                            edges_added += e_added
+                            # Add to appropriate batch
+                            doc_type = doc.get("type", "").lower()
+                            if doc_type == "relationship":
+                                # Convert relationship format to edge format
+                                start_node = doc.get("start", {})
+                                end_node = doc.get("end", {})
+                                start_id = str(start_node.get("id", ""))
+                                end_id = str(end_node.get("id", ""))
+                                edge_doc = {
+                                    "_key": f"{doc.get('id', '')}_{start_id}_{end_id}",
+                                    "_from": f"Nodes/{start_id}",
+                                    "_to": f"Nodes/{end_id}",
+                                }
+                                # Copy all other properties except special fields
+                                for key, value in doc.items():
+                                    if key not in ["_key", "_from", "_to", "type", "id", "start", "end"]:
+                                        edge_doc[key] = value
+                                edge_batch.append(edge_doc)
+                                if len(edge_batch) >= batch_size:
+                                    flush_edge_batch()
+                            elif doc_type == "edge" or ("_from" in doc and "_to" in doc):
+                                edge_batch.append(doc)
+                                if len(edge_batch) >= batch_size:
+                                    flush_edge_batch()
+                            else:
+                                node_batch.append(doc)
+                                if len(node_batch) >= batch_size:
+                                    flush_node_batch()
+
                         except json.JSONDecodeError:
                             logger.warning("Invalid JSON in line: %s...", line[:100])
                         except Exception as e:
-                            logger.warning("Error processing document: %s", e)
+                            logger.warning(f"Error processing document: {e}")
+                            continue
 
-            except Exception as e:
-                logger.error("Error processing documents: %s", e)
+                    # Flush any remaining batches
+                    flush_node_batch()
+                    flush_edge_batch()
+
+                return nodes_added, edges_added
+
+        except Exception as e:
+            retry_count += 1
+            if retry_count < max_retries:
+                logger.warning(
+                    f"Worker: Failed to access collections (attempt {retry_count}): {e}"
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Worker: Failed to access collections after {max_retries} retries: {e}")
                 raise
-
-    except Exception as e:
-        logger.error("Error connecting to database: %s", e)
-        raise
-
-    return nodes_added, edges_added
+    raise ValueError("Failed to process chunk after maximum retries")
 
 
 def get_db_max_connections(db: ArangoDatabase) -> int:
@@ -727,6 +1000,7 @@ def parallel_load_data(
     db_config: dict[str, Any],
     processes: int = 4,
     progress_queue: queue.Queue[tuple[int, int]] | None = None,
+    import_config: Optional[ImportConfig] = None
 ) -> tuple[int, int]:
     """Load data in parallel using multiple processes.
 
@@ -735,11 +1009,117 @@ def parallel_load_data(
         db_config: Database configuration
         processes: Number of processes to use
         progress_queue: Queue to report progress
+        import_config: Optional configuration for import settings and validation
 
     Returns:
         tuple[int, int]: Number of nodes and edges added
     """
     logger.info(f"Starting import with {processes} processes")
+
+    # Initialize monitoring and create collections
+    from .monitoring import ImportMonitor
+    from .connection import ArangoConnection
+    
+    # Create a connection for monitoring
+    conn = ArangoConnection(
+        host=db_config["host"],
+        port=db_config["port"],
+        username=db_config["username"],
+        password=db_config["password"],
+        db_name=db_config["db_name"]
+    )
+    
+    # First connect to _system database to create our target database
+    system_conn = ArangoConnection(
+        host=db_config["host"],
+        port=db_config["port"],
+        username=db_config["username"],
+        password=db_config["password"],
+        db_name="_system"  # Connect to system database first
+    )
+    
+    # Create the target database if it doesn't exist
+    with system_conn.get_connection() as sys_db:
+        databases = sys_db.databases()
+        if db_config['db_name'] not in databases:
+            logger.info(f"Creating database: {db_config['db_name']}")
+            sys_db.create_database(db_config['db_name'])
+            time.sleep(2)  # Wait for database creation
+            
+            # Verify database was created
+            if db_config['db_name'] not in sys_db.databases():
+                raise ValueError(f"Failed to create database {db_config['db_name']}")
+    
+    # Now connect to our target database and set up collections
+    with conn.get_connection() as db:
+        logger.info(f"Setting up collections in database: {db_config['db_name']}")
+            
+        # Get existing collections
+        collections = {c["name"]: c for c in db.collections()}
+        
+        # Create collections if they don't exist
+        try:
+            # Create Nodes collection if needed
+            if "Nodes" not in collections:
+                logger.info("Creating Nodes collection...")
+                db.create_collection("Nodes")
+                time.sleep(2)  # Wait for collection creation to complete
+                
+                # Verify Nodes collection
+                nodes_col = db.collection("Nodes")
+                if nodes_col is None:
+                    raise ValueError("Failed to create Nodes collection")
+                nodes_col.properties()  # Verify it's accessible
+                logger.info("Nodes collection created and verified")
+            
+            # Create Edges collection if needed
+            if "Edges" not in collections:
+                logger.info("Creating Edges collection...")
+                db.create_collection("Edges", edge=True)
+                time.sleep(2)  # Wait for collection creation to complete
+                
+                # Verify Edges collection
+                edges_col = db.collection("Edges")
+                if edges_col is None:
+                    raise ValueError("Failed to create Edges collection")
+                edges_col.properties()  # Verify it's accessible
+                logger.info("Edges collection created and verified")
+            
+            # Final verification of both collections
+            nodes_col = db.collection("Nodes")
+            edges_col = db.collection("Edges")
+            
+            if nodes_col is None or edges_col is None:
+                raise ValueError("Collections not properly initialized")
+                
+            # Verify both collections are accessible
+            nodes_col.properties()
+            edges_col.properties()
+            
+            logger.info("All collections successfully verified")
+            
+        except Exception as e:
+            if "duplicate name" not in str(e):
+                logger.error(f"Failed to create/verify collections: {e}")
+                raise
+            
+        # Verify collections are accessible
+        try:
+            nodes_col = db.collection("Nodes")
+            edges_col = db.collection("Edges")
+            _ = nodes_col.count()
+            _ = edges_col.count()
+            logger.info("Collections verified and ready")
+        except Exception as e:
+            logger.error(f"Failed to verify collections: {e}")
+            raise
+        
+        # Initialize monitor after collections exist
+        monitor = ImportMonitor(db)
+
+    # Get initial counts for quality verification
+    original_counts = monitor.get_node_counts()
+
     file_size = os.path.getsize(filename)
     chunk_size = file_size // processes
 
@@ -759,6 +1139,8 @@ def parallel_load_data(
                     start,
                     end,
                     progress_queue,
+                    import_config,
+                    monitor,
                 ),
             )
             tasks.append(task)
@@ -769,5 +1151,13 @@ def parallel_load_data(
     # Sum up results
     total_nodes = sum(r[0] for r in results)
     total_edges = sum(r[1] for r in results)
+
+    # Verify import quality
+    if import_config:
+        if not monitor.verify_import_quality(
+            original_counts,
+            threshold=import_config.error_threshold
+        ):
+            logger.warning("Import quality verification failed")
 
     return total_nodes, total_edges

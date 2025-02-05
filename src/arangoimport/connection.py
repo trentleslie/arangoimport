@@ -121,6 +121,7 @@ class ArangoConnection:
             self.lock = threading.Lock()
             self.disabled_indexes: dict[str, list[dict[str, Any]]] = {}
             self.connections_created = 0
+            self.edge_collection_type = kwargs.get("edge_collection_type", "edge")
             self._init_pool()
         except (ArangoClientError, OSError, ConnectionAbortedError) as e:
             # Let the original error propagate through
@@ -539,22 +540,41 @@ class ArangoError(Exception):
     pass
 
 
-def ensure_collections(db: Database) -> None:
+def ensure_collections(self, db: Database) -> None:
     """Ensure required collections exist and are of correct type.
 
     Args:
         db: Database object
     """
-    try:
-        # Create Nodes collection if it doesn't exist
-        if not db.has_collection("Nodes"):
-            db.create_collection("Nodes")
-            logger.info("Created Nodes collection")
+    # Use file lock to synchronize collection creation across processes
+    lock_file = f"/tmp/arango_collections_{self.db_name}.lock"
+    with open(lock_file, "w") as f:
+        try:
+            # Get exclusive lock
+            fcntl.flock(f, fcntl.LOCK_EX)
 
-        # Create Edges collection if it doesn't exist
-        if not db.has_collection("Edges"):
-            db.create_collection("Edges", edge=(EDGE_COLLECTION_TYPE == "edge"))
-            logger.info("Created Edges collection")
-    except CollectionCreateError as e:
-        logger.error(f"Error creating collections: {e}")
-        raise
+            try:
+                # Create Nodes collection if it doesn't exist
+                if not db.has_collection("Nodes"):
+                    db.create_collection("Nodes")
+                    logger.info("Created Nodes collection")
+                    # Sleep briefly to allow collection creation to complete
+                    time.sleep(0.5)
+
+                # Create Edges collection if it doesn't exist
+                if not db.has_collection("Edges"):
+                    db.create_collection("Edges", edge=(self.edge_collection_type == "edge"))
+                    logger.info("Created Edges collection")
+                    # Sleep briefly to allow collection creation to complete
+                    time.sleep(0.5)
+            except CollectionCreateError as e:
+                # Ignore duplicate collection errors
+                if "duplicate" not in str(e).lower():
+                    logger.error(f"Error creating collections: {e}")
+                    raise
+            finally:
+                # Release lock
+                fcntl.flock(f, fcntl.LOCK_UN)
+        except (IOError, OSError) as e:
+            logger.error(f"Error with collection lock file: {e}")
+            raise ArangoError(f"Failed to manage collection lock: {e}") from e

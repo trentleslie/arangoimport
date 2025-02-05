@@ -48,20 +48,23 @@ def import_data(file_path: str, **kwargs: Any) -> None:
         raise FileNotFoundError(f"File not found: {file_path}")
 
     try:
-        # Create import configuration
-        config = ImportConfig(
-            host=kwargs.get("host", "localhost"),
-            port=kwargs.get("port", 8529),
-            username=kwargs.get("username", "root"),
-            password=kwargs["password"],
-            db_name=kwargs.get("db_name", "spoke_human"),
-            processes=kwargs.get("processes", 4),
-        )
+        # Create database configuration
+        db_config = {
+            "host": kwargs.get("host", "localhost"),
+            "port": kwargs.get("port", 8529),
+            "username": kwargs.get("username", "root"),
+            "password": kwargs["password"],
+            "db_name": kwargs.get("db_name", "spoke_human"),
+        }
+
+        # Create import configuration with default settings
+        import_config = ImportConfig()
 
         nodes_added, edges_added = parallel_load_data(
             file_path,
-            config.to_dict(),
-            processes=config.processes,
+            db_config,
+            processes=kwargs.get("processes", 4),
+            import_config=import_config
         )
 
         console.print("[green]Import successfully completed![/green]")
