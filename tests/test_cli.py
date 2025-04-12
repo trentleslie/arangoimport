@@ -13,7 +13,7 @@ from arangoimport.cli import cli
 # Constants for test values
 DEFAULT_PROCESSES = 4
 CLICK_ERROR_CODE = 2
-DEFAULT_DB_NAME = "spoke_human"
+DEFAULT_DB_NAME = "spokeV6"
 DEFAULT_USERNAME = "root"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8529
