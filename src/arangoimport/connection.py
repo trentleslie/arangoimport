@@ -19,7 +19,7 @@ from arango.exceptions import (
 )
 from arango.job import AsyncJob, BatchJob
 
-from arangoimport.logging import get_logger
+from arangoimport.log_config import get_logger
 
 logger = get_logger(__name__)
 
@@ -44,7 +44,7 @@ class ImportConfig:
     port: int = 8529
     username: str = "root"
     password: str | None = None
-    db_name: str = "spoke_human"
+    db_name: str = "spokeV6"
     processes: int = 4
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,15 +96,27 @@ class ArangoConnection:
             **kwargs: Additional configuration options
         """
         try:
+            # Parse host and port correctly
+            parsed_host = host
+            parsed_port = port
+            if ':' in host:
+                host_parts = host.split(':')
+                parsed_host = host_parts[0]
+                try:
+                    parsed_port = int(host_parts[1])
+                except (ValueError, IndexError):
+                    # Handle potential errors if port part is not a valid integer or missing
+                    raise ArangoError(f"Invalid host format: {host}. Expected format 'host' or 'host:port'.")
+
             config: ArangoConfig = {
-                "host": host,
-                "port": port,
+                "host": parsed_host,
+                "port": parsed_port,
                 "username": username,
                 "password": password,
-                "db_name": kwargs.get("db_name", "spoke_human"),
-                "pool_size": kwargs.get("pool_size", 10),
-                "max_retries": kwargs.get("max_retries", 3),
-                "retry_delay": kwargs.get("retry_delay", 1.0),
+                "db_name": kwargs.get("db_name", "spokeV6"),
+                "pool_size": kwargs.get("pool_size", 32),  # Increased pool size
+                "max_retries": kwargs.get("max_retries", 5),  # More retries
+                "retry_delay": kwargs.get("retry_delay", 2.0),  # Longer delay
             }
 
             self.host = config["host"]
@@ -116,6 +128,7 @@ class ArangoConnection:
             self.max_retries = config["max_retries"]
             self.retry_delay = config["retry_delay"]
 
+            # Initialize client with correctly parsed host and port
             self.client = ArangoClient(hosts=f"http://{self.host}:{self.port}")
             self.pool: Queue[Database] = Queue(maxsize=self.pool_size)
             self.lock = threading.Lock()
@@ -506,7 +519,7 @@ class ArangoConnection:
                     # Create Edges collection if it doesn't exist
                     if not db.has_collection("Edges"):
                         db.create_collection(
-                            "Edges", edge=(EDGE_COLLECTION_TYPE == "edge")
+                            "Edges", edge=(self.edge_collection_type == "edge")
                         )
                         logger.info("Created Edges collection")
                         # Sleep briefly to allow collection creation to complete

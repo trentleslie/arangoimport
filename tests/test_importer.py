@@ -706,7 +706,7 @@ def temp_json_file() -> str:
         f.write('{"type":"node","_key":"1","data":"node1"}\n')
         f.write('{"type":"node","_key":"2","data":"node2"}\n')
         f.write(
-            '{"type":"edge","_key":"e1","_from":"nodes/1","_to":"nodes/2","label":"test_edge"}\n'
+            '{"type":"edge","_key":"e1","_from":"Nodes/node1","_to":"Nodes/node2","label":"test_edge","neo4j_start_id":"1","neo4j_end_id":"2"}\n'
         )
     yield f.name
     os.unlink(f.name)

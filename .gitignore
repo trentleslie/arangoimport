@@ -191,3 +191,13 @@ logs/
 # System files
 .DS_Store
 Thumbs.db
+
+# Backup and temporary files
+*.backup
+*.bak
+*.current
+*.old
+*.orig
+*.tmp
+importer.py.backup
+importer.py.current

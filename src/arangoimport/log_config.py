@@ -5,13 +5,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Map log level strings to logging constants
+LOG_LEVELS = {
+    'DEBUG': logging.DEBUG,
+    'INFO': logging.INFO,
+    'WARNING': logging.WARNING,
+    'ERROR': logging.ERROR,
+    'CRITICAL': logging.CRITICAL,
+}
 
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(level_str: str = 'WARNING') -> None:
     """Configure logging for the application.
 
     Args:
-        level: Logging level (default: INFO)
+        level_str: Logging level string (e.g., 'DEBUG', 'INFO'). Default: 'WARNING'
     """
+    # Get the corresponding logging level constant, default to WARNING if invalid
+    level = LOG_LEVELS.get(level_str.upper(), logging.WARNING)
+
     # Create logs directory if it doesn't exist
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
