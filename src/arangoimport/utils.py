@@ -7,7 +7,7 @@ from typing import Any, NotRequired, TypedDict, TypeVar
 
 import psutil
 
-from .logging import get_logger
+from .log_config import get_logger
 
 logger = get_logger(__name__)
 

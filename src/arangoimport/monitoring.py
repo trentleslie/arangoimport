@@ -30,6 +30,7 @@ class ImportMonitor:
     
     def __init__(self, db: ArangoDatabase):
         self.db = db
+        self.stats = ImportStats()
         self.queries = {
             "node_counts": """
                 FOR doc IN @@collection
@@ -126,6 +127,34 @@ class ImportMonitor:
             
         return True
         
+    def update_stats(self, stats: ImportStats) -> None:
+        """Update import statistics.
+
+        Args:
+            stats: Import statistics to update
+        """
+        try:
+            # Update stats
+            self.stats.processed += stats.processed
+            self.stats.skipped += stats.skipped
+            self.stats.errors.extend(stats.errors)
+
+            # Log progress
+            logger.info(
+                f"Progress: {self.stats.processed} processed, "
+                f"{self.stats.skipped} skipped, "
+                f"{len(self.stats.errors)} errors"
+            )
+
+            # Check error rate
+            error_rate = self.stats.error_rate
+            if error_rate > 0.01:  # 1% error threshold
+                logger.warning(
+                    f"High error rate detected: {error_rate:.2%}"
+                )
+        except Exception as e:
+            logger.error(f"Error updating stats: {e}")
+
     def log_progress(self, stats: ImportStats) -> None:
         """Log current import progress."""
         logger.info(
