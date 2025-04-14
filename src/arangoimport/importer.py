@@ -361,10 +361,49 @@ def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMap
 
     
     if valid_edges:
+        # Track the batch information using our enhanced logging
         try:
+            from arangoimport.enhanced_logging import batch_tracker
+            
+            # Generate a unique batch ID based on the first edge key
+            batch_id = int(valid_edges[0].get('_key', '0')) % 1000000
+            
+            # Record batch start before processing
+            batch_tracker.record_batch_start(batch_id, len(valid_edges))
+            
+            # Record edge types for analysis
+            for edge in valid_edges:
+                if "label" in edge:
+                    batch_tracker.record_edge_type(edge["label"])
+                    
+            # Log if batch size is divisible by 100 (suspicious pattern)
+            if len(valid_edges) % 100 == 0:
+                logger.info(f"Processing batch {batch_id} with {len(valid_edges)} edges (divisible by 100)")
+            
+            # Normal processing continues
             result = batch_save_documents(edges_col, valid_edges, batch_size=1000)
+            
+            # Record successful batch completion
+            edges_saved = result.get('created', 0) + result.get('updated', 0) + result.get('ignored', 0)
+            batch_tracker.record_batch_completion(batch_id, edges_saved)
+            
+            # Check if the counts match what we expected
+            if edges_saved != len(valid_edges):
+                logger.warning(
+                    f"Batch {batch_id} mismatch: sent {len(valid_edges)} edges but saved {edges_saved}. "
+                    f"Created: {result.get('created', 0)}, Updated: {result.get('updated', 0)}, "
+                    f"Ignored: {result.get('ignored', 0)}"
+                )
         except Exception as e:
             logger.error(f"Failed to save edge batch: {e}")
+            
+            # Record batch error
+            try:
+                batch_tracker.record_batch_error(batch_id, e)
+            except NameError:
+                # In case the enhanced logging import failed
+                pass
+                
             if len(valid_edges) > 1:
                 # Try saving edges individually to identify problematic ones
                 for edge in valid_edges:
@@ -375,6 +414,12 @@ def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMap
                             f"Failed to save edge {edge.get('_key', 'unknown')}: {e2}. "
                             f"From: {edge.get('_from')}, To: {edge.get('_to')}"
                         )
+                        
+                        # Record individual edge rejection
+                        try:
+                            batch_tracker.record_edge_rejection(edge.get('_key', 'unknown'), str(e2))
+                        except NameError:
+                            pass
             raise
 
 @retry_with_backoff(max_retries=3)
