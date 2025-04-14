@@ -1,0 +1,33 @@
+SPOKE meta-path	Description	
+		EC = "Enzyme Commission" = enzyme function
+Direct binding/interaction:		
+Compound -- binds --> Protein	Drug directly binds to the target protein. 	
+Protein -- interacts --> Compound	Drug interacts with the target protein (from STITCH data). Similar significance to binding. 	
+Compound -- binds --> ProteinDomain -- part_of --> Protein	Drug binds to a specific domain which is part of the target protein.	
+		
+Modulation via gene expression:		* NOTE: up/downregulates may not be particularly useful if context is different than ours (blood)
+Compound -- down_regulates --> Gene -- encodes --> Protein	Drug causes decreased expression of the gene that codes for the target protein.	
+Compound -- up_regulates --> Gene -- encodes --> Protein	Drug causes increased expression of the gene that codes for the target protein.	
+		
+Targeting metabolites via reactions:		
+Compound -- binds --> Protein -- has_ec --> EC -- catalyzes --> Reaction -- produces --> Compound	Drug binds a protein involved in a reaction that produces the target metabolite.	
+Compound -- binds --> Protein -- has_ec --> EC -- catalyzes --> Reaction -- consumes --> Compound	Drug binds a protein involved in a reaction that consumes the target metabolite.	
+Compound -- [up/down]regulates --> Gene -- encodes --> Protein -- has_ec --> EC -- catalyzes --> Reaction -- [produces/consumes] --> Compound	Drug affects the expression of a protein involved in a reaction that produces or consumes the target metabolite.	
+		
+Targeting proteins via pathway/interaction:		
+Compound -- binds --> Protein -- interacts --> Protein	Drug binds a protein that interacts with the target protein; suggests potential downstream effects on target protein.	
+Compound -- [up/down]regulates --> Gene -- encodes --> Protein -- interacts --> Protein	Drug affects expression of a protein that interacts with the target protein.	
+Compound -- [up/down]regulates --> Gene -- participates --> Pathway <-- participates -- Gene -- encodes --> Protein	Drug affects expression of a gene that participates in the same pathway as the gene encoding the target protein.	
+Compound -- binds --> Protein -- [shares pathways/reactions/metabolites with] --> Protein	Drug binds a protein that shares metabolites/reactions/pathways with the target protein.	
+		
+Disease treatment context:		
+Compound -- treats --> Disease <-- associates -- Gene -- encodes --> Protein	Drug treats a disease associated with the gene encoding the target protein. Implies drug might counteract protein's role in the disease.	
+Compound -- treats --> Disease ... Gene/Protein ... Pathway ... Protein	Drug treats a disease related to a pathway the target protein is involved in.	
+		
+Pharmacological class context:		
+Compound <-- includes -- PharmacologicClass -- includes --> Compound -- binds --> Protein	Drug belongs to the same pharmacological class as another compound known to bind the target protein. Suggests potential similar activity.	
+		
+		
+Legend:		
+Green = protein/metabolite in the signature (starting point)		
+Yellowish = potentially relevant drug/compound		
