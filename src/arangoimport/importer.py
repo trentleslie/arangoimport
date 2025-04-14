@@ -270,14 +270,20 @@ def process_nodes_batch(
     return nodes_added
 
 
-def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMapper, edges_col: Collection) -> None:
+def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMapper, edges_col: Collection, worker_id: str = None) -> None:
     """Process a batch of edges using batch ID lookup.
     
     Args:
         edge_batch: List of tuples containing (doc, start_id, end_id)
         id_mapper: ID mapper instance
         edges_col: Edges collection
+        worker_id: Optional identifier for the worker processing this batch
     """
+    # Generate worker_id if not provided
+    if worker_id is None:
+        import os
+        import threading
+        worker_id = f"pid_{os.getpid()}_thread_{threading.get_ident()}"
     # Keep track of edges we've seen to avoid duplicates
     seen_edges = set()
     
@@ -368,8 +374,8 @@ def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMap
             # Generate a unique batch ID based on the first edge key
             batch_id = int(valid_edges[0].get('_key', '0')) % 1000000
             
-            # Record batch start before processing
-            batch_tracker.record_batch_start(batch_id, len(valid_edges))
+            # Record batch start before processing with worker ID
+            batch_tracker.record_batch_start(batch_id, len(valid_edges), worker_id)
             
             # Record edge types for analysis
             for edge in valid_edges:
@@ -383,9 +389,9 @@ def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMap
             # Normal processing continues
             result = batch_save_documents(edges_col, valid_edges, batch_size=1000)
             
-            # Record successful batch completion
+            # Record successful batch completion with worker ID
             edges_saved = result.get('created', 0) + result.get('updated', 0) + result.get('ignored', 0)
-            batch_tracker.record_batch_completion(batch_id, edges_saved)
+            batch_tracker.record_batch_completion(batch_id, edges_saved, worker_id)
             
             # Check if the counts match what we expected
             if edges_saved != len(valid_edges):
@@ -399,7 +405,7 @@ def process_edge_batch(edge_batch: list[tuple[dict, str, str]], id_mapper: IDMap
             
             # Record batch error
             try:
-                batch_tracker.record_batch_error(batch_id, e)
+                batch_tracker.record_batch_error(batch_id, e, worker_id)
             except NameError:
                 # In case the enhanced logging import failed
                 pass
@@ -1621,7 +1627,11 @@ def process_chunk(
                                 # Process in smaller sub-batches if needed
                                 sub_batch = edge_batch[:batch_size]
 
-                                process_edge_batch(sub_batch, id_mapper, edges_col)
+                                # Generate a unique worker ID for tracking
+                                worker_id = f"pid_{os.getpid()}_chunk_{start_pos}_{end_pos}_batch_{retry_count}"
+                                
+                                # Process this batch with worker ID tracking
+                                process_edge_batch(sub_batch, id_mapper, edges_col, worker_id)
                                 edges_added += len(sub_batch)
                                 
                                 if progress_queue is not None:
