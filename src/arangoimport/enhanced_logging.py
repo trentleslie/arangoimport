@@ -1,4 +1,5 @@
-"""Enhanced logging module for tracking batch processing in edge imports."""
+"""Enhanced logging module for tracking batch processing in edge imports.
+   OPTIMIZED VERSION: Focuses only on edge batches divisible by 100."""
 
 import logging
 from typing import Dict, Set, Any, List, Tuple, Optional
@@ -46,15 +47,21 @@ class BatchTracker:
             os.makedirs(log_dir)
     
     def record_batch_start(self, batch_num: int, batch_size: int, worker_id: str = "unknown") -> None:
-        """Record the start of batch processing."""
+        """Record the start of batch processing.
+        OPTIMIZED: Only log edge batches divisible by 100"""
+        
+        # Skip node batches completely - only track edges
+        if not batch_num or 'edge' not in str(batch_num).lower():
+            return
+            
         self.batch_counts[batch_num] = batch_size
         self.total_edges_seen += batch_size
         
-        # Track batch size distribution
-        self.batch_size_distribution[batch_size] += 1
-        
-        # Special tracking for the "divisible by 100" pattern
+        # Track batch size distribution, but only for batches divisible by 100
         if batch_size % 100 == 0:
+            self.batch_size_distribution[batch_size] += 1
+            
+            # Special tracking for the "divisible by 100" pattern
             entry = {
                 "batch_num": batch_num,
                 "size": batch_size,
@@ -65,98 +72,119 @@ class BatchTracker:
             self.mod_100_batches.append(entry)
             self.mod_100_outcomes[batch_num] = entry.copy()
             logger.info(f"[MOD-100] Starting batch {batch_num} with {batch_size} edges (divisible by 100) on worker {worker_id}")
-        else:
-            logger.info(f"Starting batch {batch_num} with {batch_size} edges on worker {worker_id}")
         
-        # Track by worker process
-        if worker_id not in self.worker_process_stats:
-            self.worker_process_stats[worker_id] = {
-                "batches_started": 0,
-                "edges_seen": 0,
-                "edges_saved": 0,
-                "errors": 0,
-                "mod_100_batches": 0
-            }
-        
-        self.worker_process_stats[worker_id]["batches_started"] += 1
-        self.worker_process_stats[worker_id]["edges_seen"] += batch_size
-        
-        if batch_size % 100 == 0:
+            # Track by worker process, but only for mod-100 batches
+            if worker_id not in self.worker_process_stats:
+                self.worker_process_stats[worker_id] = {
+                    "batches_started": 0,
+                    "edges_seen": 0,
+                    "edges_saved": 0,
+                    "errors": 0,
+                    "mod_100_batches": 0
+                }
+            
+            self.worker_process_stats[worker_id]["batches_started"] += 1
+            self.worker_process_stats[worker_id]["edges_seen"] += batch_size
             self.worker_process_stats[worker_id]["mod_100_batches"] += 1
     
     def record_batch_error(self, batch_num: int, error: Exception, worker_id: str = "unknown") -> None:
-        """Record a batch processing error."""
-        self.error_batches.add(batch_num)
-        
-        # Track by worker process
-        if worker_id in self.worker_process_stats:
-            self.worker_process_stats[worker_id]["errors"] += 1
-        
-        # Special tracking for the "divisible by 100" pattern
+        """Record a batch processing error.
+        OPTIMIZED: Only log edge batches divisible by 100"""
+        # Skip node batches completely - only track edges
+        if not batch_num or 'edge' not in str(batch_num).lower():
+            return
+            
+        # Only track errors for mod-100 batches
         if batch_num in self.mod_100_outcomes:
+            self.error_batches.add(batch_num)
+            
+            # Track by worker process
+            if worker_id in self.worker_process_stats:
+                self.worker_process_stats[worker_id]["errors"] += 1
+            
+            # Special tracking for the "divisible by 100" pattern
             self.mod_100_outcomes[batch_num].update({
                 "status": "error",
                 "error": str(error),
                 "completion_timestamp": time.time()
             })
+            logger.error(f"[MOD-100] Error in batch {batch_num} on worker {worker_id}: {str(error)}")
             logger.error(f"[MOD-100] Error processing batch {batch_num} on worker {worker_id}: {error}")
         else:
             logger.error(f"Error processing batch {batch_num} on worker {worker_id}: {error}")
     
     def record_batch_skip(self, batch_num: int, reason: str) -> None:
-        """Record a completely skipped batch."""
-        self.skipped_batches.add(batch_num)
+        """Record a completely skipped batch.
+        OPTIMIZED: Only log edge batches divisible by 100"""
+        # Skip node batches completely - only track edges
+        if not batch_num or 'edge' not in str(batch_num).lower():
+            return
+            
+        # Only track skips for batches divisible by 100
+        if batch_num in self.mod_100_outcomes:
+            self.skipped_batches.add(batch_num)
+            logger.warning(f"[MOD-100] Skipped batch {batch_num}: {reason}")
         logger.warning(f"Skipped batch {batch_num}: {reason}")
     
     def record_batch_completion(self, batch_num: int, edges_saved: int, worker_id: str = "unknown") -> None:
-        """Record successful batch completion."""
+        """Record successful batch completion.
+        OPTIMIZED: Only log edge batches"""
+        # Skip node batches completely - only track edges
+        if not batch_num or 'edge' not in str(batch_num).lower():
+            return
+            
+        # Add to the total count of saved edges
         self.total_edges_saved += edges_saved
         
-        # Track by worker process
-        if worker_id in self.worker_process_stats:
-            self.worker_process_stats[worker_id]["edges_saved"] += edges_saved
-        
-        # Check for discrepancies between expected and actual saved counts
-        if batch_num in self.batch_counts:
-            expected = self.batch_counts[batch_num]
-            if edges_saved != expected:
-                logger.warning(
-                    f"Batch {batch_num} saved {edges_saved} edges but expected {expected}"
-                )
-                
-                # Special tracking for "divisible by 100" pattern
-                if expected % 100 == 0 or edges_saved % 100 == 0:
-                    missing = expected - edges_saved
-                    logger.warning(f"[MOD-100] Batch {batch_num} has {missing} missing edges (expected={expected}, saved={edges_saved})")
-                    
-                    if batch_num in self.mod_100_outcomes:
-                        self.mod_100_outcomes[batch_num].update({
-                            "status": "incomplete",
-                            "expected": expected,
-                            "saved": edges_saved,
-                            "missing": missing,
-                            "completion_timestamp": time.time()
-                        })
-        
-        # Update mod 100 tracking if applicable
+        # Special handling for batches divisible by 100
         if batch_num in self.mod_100_outcomes:
+            # Calculate any discrepancy
+            expected = self.batch_counts.get(batch_num, 0)
+            missing = expected - edges_saved
+            
+            # Update worker stats
+            if worker_id in self.worker_process_stats:
+                self.worker_process_stats[worker_id]["edges_saved"] += edges_saved
+            
+            # Update the tracking record
             self.mod_100_outcomes[batch_num].update({
                 "status": "completed",
                 "saved": edges_saved,
+                "expected": expected,
+                "missing": missing,
                 "completion_timestamp": time.time()
             })
+            
+            # Log completion with more details for batches divisible by 100
+            if missing > 0:
+                logger.warning(
+                    f"[MOD-100] Batch {batch_num} completed but missing edges: "
+                    f"expected {expected}, saved {edges_saved}, missing {missing} on worker {worker_id}"
+                )
+            else:
+                logger.info(
+                    f"[MOD-100] Batch {batch_num} completed successfully: "
+                    f"saved all {edges_saved} edges on worker {worker_id}"
+                )
             logger.info(f"[MOD-100] Completed batch {batch_num}, saved {edges_saved} edges on worker {worker_id}")
         else:
             logger.info(f"Completed batch {batch_num}, saved {edges_saved} edges on worker {worker_id}")
     
     def record_edge_rejection(self, edge_key: str, reason: str) -> None:
-        """Record a rejected edge."""
-        self.rejected_edges.add(edge_key)
+        """Record a rejected edge.
+        OPTIMIZED: Only track rejects for mod-100 batches"""
+        # Only track if we're investigating a mod-100 batch
+        if any(self.mod_100_outcomes):
+            self.rejected_edges.add(edge_key)
+            logger.warning(f"[MOD-100] Edge rejected: {edge_key}, reason: {reason}")
         logger.warning(f"Rejected edge {edge_key}: {reason}")
     
     def record_edge_type(self, edge_type: str) -> None:
-        """Record an edge type for aggregation."""
-        self.edge_type_counts[edge_type] += 1
+        """Record an edge type for aggregation.
+        OPTIMIZED: Only track for mod-100 batches"""
+        # Only track edge types when we're actively processing mod-100 batches
+        if any(self.mod_100_outcomes):
+            self.edge_type_counts[edge_type] += 1
     
     def save_statistics(self) -> None:
         """Save all collected statistics to disk."""
